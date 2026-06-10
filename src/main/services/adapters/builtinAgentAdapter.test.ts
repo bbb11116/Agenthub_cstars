@@ -1,0 +1,428 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import type { AgentRunInput } from "../../../shared/agentAdapter";
+
+const {
+  callLLM,
+  callLLMStream,
+  callLLMWithToolSupport,
+  callLLMStreamWithContinuation,
+  executeWebTool,
+  loadMainAgentConfig
+} = vi.hoisted(() => ({
+  callLLM: vi.fn(),
+  callLLMStream: vi.fn(),
+  callLLMWithToolSupport: vi.fn(),
+  callLLMStreamWithContinuation: vi.fn(),
+  executeWebTool: vi.fn(),
+  loadMainAgentConfig: vi.fn()
+}));
+
+vi.mock("../configService", () => ({
+  loadMainAgentConfig
+}));
+
+vi.mock("../llmRouter", () => ({
+  callLLM,
+  callLLMStream,
+  callLLMWithToolSupport,
+  callLLMStreamWithContinuation
+}));
+
+vi.mock("../webToolService", () => ({
+  WEB_TOOL_DEFINITIONS: {
+    web_search: {
+      name: "web_search",
+      description: "Search the web.",
+      inputSchema: { type: "object", properties: { query: { type: "string" } } }
+    },
+    web_fetch: {
+      name: "web_fetch",
+      description: "Fetch a page.",
+      inputSchema: { type: "object", properties: { url: { type: "string" } } }
+    }
+  },
+  createWebToolCall: (name: string, args: Record<string, unknown>) => ({
+    id: "fallback-call",
+    name,
+    arguments: args
+  }),
+  executeWebTool
+}));
+
+import { BuiltinAgentAdapter } from "./builtinAgentAdapter";
+
+describe("BuiltinAgentAdapter", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    callLLMStreamWithContinuation.mockImplementation((...args) =>
+      callLLMStream(...args)
+    );
+  });
+
+  it("uses the configured Model Provider and preserves conversation context", async () => {
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "mimo-v2.5-pro"
+    };
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You answer weather questions.",
+      userMessage: "上海今天天气如何？",
+      contextMessages: [
+        { role: "user", content: "你是谁？" },
+        { role: "agent", content: "我是天气助手。" },
+        { role: "user", content: "上海今天天气如何？" }
+      ],
+      toolPermissions: [],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 40,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "上海今天天气如何？"
+      },
+      resume: { enabled: false }
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLM.mockResolvedValue("上海今天晴。");
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(loadMainAgentConfig).toHaveBeenCalledWith("/workspace");
+    expect(callLLM).toHaveBeenCalledWith(
+      config,
+      input.systemPrompt,
+      [
+        { role: "user", content: "你是谁？" },
+        { role: "assistant", content: "我是天气助手。" },
+        { role: "user", content: "上海今天天气如何？" }
+      ]
+    );
+    expect(events).toEqual([
+      { type: "status", status: "running" },
+      { type: "text_delta", content: "上海今天晴。" },
+      { type: "status", status: "completed" }
+    ]);
+  });
+
+  it("yields configured provider stream deltas incrementally", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "Answer concisely.",
+      userMessage: "hello",
+      toolPermissions: [],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 40,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "hello"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMStream.mockImplementation(async function* () {
+      yield { type: "text_delta", text: "hel" };
+      yield { type: "text_delta", text: "lo" };
+      yield { type: "done" };
+    });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(callLLM).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      { type: "status", status: "running" },
+      { type: "text_delta", content: "hel" },
+      { type: "text_delta", content: "lo" },
+      { type: "status", status: "completed" }
+    ]);
+  });
+
+  it("falls back to the non-stream call when streaming fails before output", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "Answer concisely.",
+      userMessage: "hello",
+      toolPermissions: [],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 40,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "hello"
+      },
+      resume: { enabled: false }
+    };
+
+    loadMainAgentConfig.mockReturnValue({
+      provider: "openai_chat_completions",
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true
+    });
+    callLLMStream.mockImplementation(async function* () {
+      yield { type: "error", message: "stream unavailable" };
+    });
+    callLLM.mockResolvedValue("fallback response");
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(events).toEqual([
+      { type: "status", status: "running" },
+      { type: "text_delta", content: "fallback response" },
+      { type: "status", status: "completed" }
+    ]);
+  });
+
+  it("marks a streamed truncated model output as failed", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "Answer concisely.",
+      userMessage: "hello",
+      toolPermissions: [],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 40,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "hello"
+      },
+      resume: { enabled: false }
+    };
+
+    loadMainAgentConfig.mockReturnValue({
+      provider: "openai_chat_completions",
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true
+    });
+    callLLMStream.mockImplementation(async function* () {
+      yield { type: "text_delta", text: "partial" };
+      yield { type: "done", outputTruncated: true };
+    });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(callLLM).not.toHaveBeenCalled();
+    expect(events).toEqual([
+      { type: "status", status: "running" },
+      { type: "text_delta", content: "partial" },
+      { type: "error", message: "Model output was truncated before completion (token budget reached)." },
+      { type: "status", status: "failed" }
+    ]);
+  });
+
+  it("runs native web tool calls and feeds the result back to the model", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "Answer with sources.",
+      userMessage: "MiniMax 3.0 有联网吗？",
+      toolPermissions: ["webSearch=true, webFetch=false"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "MiniMax 3.0 有联网吗？"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport
+      .mockResolvedValueOnce({
+        text: "",
+        toolCalls: [
+          {
+            id: "call-1",
+            name: "web_search",
+            arguments: { query: "MiniMax 3.0 web search" }
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        text: "MiniMax API 本身不内置联网，AgentHub 通过 web_search 工具补齐。",
+        toolCalls: []
+      });
+    executeWebTool.mockResolvedValue({
+      query: "MiniMax 3.0 web search",
+      provider: "mock",
+      results: [
+        {
+          title: "MiniMax docs",
+          url: "https://example.test/minimax",
+          snippet: "OpenAI-compatible API."
+        }
+      ]
+    });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(callLLM).not.toHaveBeenCalled();
+    expect(callLLMWithToolSupport).toHaveBeenCalledTimes(2);
+    expect(executeWebTool).toHaveBeenCalledWith(
+      {
+        id: "call-1",
+        name: "web_search",
+        arguments: { query: "MiniMax 3.0 web search" }
+      },
+      undefined
+    );
+    expect(events).toEqual([
+      { type: "status", status: "running" },
+      {
+        type: "structured_result",
+        result: {
+          toolCalls: [
+            {
+              id: "call-1",
+              name: "web_search",
+              arguments: { query: "MiniMax 3.0 web search" }
+            }
+          ]
+        }
+      },
+      {
+        type: "structured_result",
+        result: {
+          toolResults: [
+            {
+              toolCallId: "call-1",
+              name: "web_search",
+              result: {
+                query: "MiniMax 3.0 web search",
+                provider: "mock",
+                results: [
+                  {
+                    title: "MiniMax docs",
+                    url: "https://example.test/minimax",
+                    snippet: "OpenAI-compatible API."
+                  }
+                ]
+              },
+              ok: true
+            }
+          ]
+        }
+      },
+      {
+        type: "text_delta",
+        content: "MiniMax API 本身不内置联网，AgentHub 通过 web_search 工具补齐。"
+      },
+      { type: "status", status: "completed" }
+    ]);
+  });
+
+  it("uses the JSON web tool protocol when native tool calling is unsupported", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "Answer with sources.",
+      userMessage: "查一下 AgentHub",
+      toolPermissions: ["webSearch=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "查一下 AgentHub"
+      },
+      resume: { enabled: false }
+    };
+
+    loadMainAgentConfig.mockReturnValue({
+      provider: "openai_chat_completions",
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "unsupported"
+    });
+    callLLM
+      .mockResolvedValueOnce("{\"action\":\"web_search\",\"query\":\"AgentHub\",\"maxResults\":3}")
+      .mockResolvedValueOnce("AgentHub 是一个 agent 工作台。");
+    executeWebTool.mockResolvedValue({
+      query: "AgentHub",
+      provider: "mock",
+      results: []
+    });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(callLLMWithToolSupport).not.toHaveBeenCalled();
+    expect(callLLM).toHaveBeenCalledTimes(2);
+    expect(events.at(-2)).toEqual({
+      type: "text_delta",
+      content: "AgentHub 是一个 agent 工作台。"
+    });
+    expect(events.at(-1)).toEqual({ type: "status", status: "completed" });
+  });
+});

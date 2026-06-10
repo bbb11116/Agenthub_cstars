@@ -1,0 +1,1161 @@
+import type {
+  Agent,
+  Conversation,
+  Message,
+  RunAgentOutput,
+  RunAgentStreamEvent,
+  Workspace
+} from "../../shared/domain";
+import type { RuntimeProvider } from "../../shared/runtime";
+import type { AgentAdapter, AgentEvent, AgentRunInput } from "../../shared/agentAdapter";
+import {
+  AGENT_EXECUTION_LIMITS,
+  type AgentExecutionMode,
+  type AgentRunOptions,
+  type AgentRunResult
+} from "../../shared/agentExecution";
+import {
+  ConversationNotFoundError,
+  ProviderMismatchError,
+  ConversationAlreadyRunningError,
+  ResumeFailedError,
+  FallbackRebuildFailedError
+} from "../../shared/agentAdapter";
+import { isBuiltinProvider } from "../../shared/runtime";
+import {
+  DEFAULT_CONTEXT_WINDOW_TOKENS,
+  DEFAULT_MAX_OUTPUT_TOKENS
+} from "../../shared/modelProvider";
+import { runMainAgent } from "./orchestratorRuntimeService";
+import { getDatabase, type AgentHubDatabase } from "../db";
+import { getAgentById, updateAgentStatus as updateAgentStatusInRepo } from "../db/repositories/agentRepo";
+import { getConversationById, createConversation } from "../db/repositories/conversationRepo";
+import { getWorkspaceById } from "../db/repositories/workspaceRepo";
+import {
+  createProviderSession,
+  getActiveProviderSession,
+  updateProviderSessionStatus,
+  markActiveSessionsAsReplaced,
+  type ProviderSessionExecutionScope
+} from "../db/repositories/providerSessionRepo";
+import {
+  createAgentRun,
+  getRunningAgentRunByScope,
+  updateAgentRunStatus,
+  updateAgentRunProviderSessionId,
+  updateAgentRunRawOutput,
+  markAgentRunUsedFallback
+} from "../db/repositories/agentRunRepo";
+import { getAdapter } from "./adapters";
+import { RUNTIME_PROVIDER_LABELS } from "../../shared/runtime";
+import { getResolvedConfig, loadMainAgentConfig } from "./configService";
+import { resolveProviderEnv } from "../config/provider-env-resolver";
+import {
+  buildConversationContextForAgentRun,
+  DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS,
+  type ContextBudget
+} from "./conversationContextService";
+import { resolveExecutionWorkspaceForConversation } from "./workspaceContextResolver";
+import { buildDirectAgentMemoryContext } from "./memoryContextService";
+import { createMessage } from "./messageService";
+import { createDiffProposalFromText } from "./diffProposalTextService";
+import { UNIFIED_RUN_POLICY } from "../../shared/agentRunPolicy";
+import {
+  runStreamingAgent,
+  type StreamingRunSink
+} from "./streamingRunService";
+import type { AgentRunEvent } from "../../shared/agentRunEvent";
+import { acquireConversationRun } from "./conversationRunLock";
+import {
+  getAgentRunsByConversation
+} from "../db/repositories/agentRunRepo";
+import { getArtifactsByMessage } from "../db/repositories/messageArtifactRepo";
+import { appendMessageThinking } from "../db/repositories/messageRepo";
+import { buildAgentSkillsSystemPrompt } from "./agentSkillCatalogService";
+
+export type RunWithConversationStreamSink = (event: RunAgentStreamEvent) => void;
+
+const DIRECT_EDIT_POLICY = [
+  "AgentHub workspace editing policy:",
+  "Language policy: follow the user's latest message language. If the user writes in Chinese, answer in Chinese unless they explicitly request another language.",
+  "For explicit code or file modification requests only, produce a valid DiffProposal through AgentHub.",
+  "For ordinary chat, identity questions, architecture discussion, code explanation, and design advice, answer naturally as plain text.",
+  "Do not emit DiffProposal or 'No file changes proposed' blocks unless you are responding to an explicit modification request.",
+  "Do not bypass AgentHub apply_diff by writing final file changes directly.",
+  "Do not read or write files outside workspace.rootPath."
+].join("\n");
+const GROUP_SUBAGENT_POLICY = [
+  "AgentHub group sub-agent policy:",
+  "Language policy: follow the user's latest message language. If the user writes in Chinese, make summaries and reports Chinese unless explicitly requested otherwise.",
+  "You only handle the assigned acceptance criteria.",
+  "Do not edit workspace files directly.",
+  "For assigned code or file modification criteria, produce a valid DiffProposal through AgentHub apply_diff review flow.",
+  "For analysis, explanation, review, or report criteria, do not emit a DiffProposal block.",
+  "Return one SubAgentResult JSON object as your final message."
+].join("\n");
+function formatToolPermissions(agent: Agent): string {
+  return Object.entries({ ...agent.tools, applyDiff: false })
+    .map(([tool, enabled]) => `${tool}=${enabled ? "true" : "false"}`)
+    .join(", ");
+}
+
+function buildEffectiveSystemPrompt(
+  agent: Agent,
+  mode: AgentExecutionMode,
+  maxIterations: number
+): string {
+  const runtimePolicy = mode === "group_subagent"
+    ? GROUP_SUBAGENT_POLICY
+    : DIRECT_EDIT_POLICY;
+  const skillsPrompt = buildAgentSkillsSystemPrompt(agent.skillIds ?? []);
+
+  return [
+    agent.systemPrompt,
+    skillsPrompt,
+    runtimePolicy,
+    `Execution mode: ${mode}. ReAct-like iteration budget: maxIterations=${maxIterations}.`,
+    UNIFIED_RUN_POLICY
+  ]
+    .filter((part) => part.trim().length > 0)
+    .join("\n\n");
+}
+
+function getContextBudget(
+  provider: RuntimeProvider,
+  rootPath: string
+): ContextBudget {
+  if (isBuiltinProvider(provider)) {
+    try {
+      const limits = loadMainAgentConfig(rootPath).limits;
+      return {
+        contextWindowTokens: limits.contextWindowTokens,
+        reservedOutputTokens: limits.maxOutputTokens,
+        safetyMarginTokens: DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
+      };
+    } catch {
+      // The adapter will report a config error. Use defaults while preparing context.
+    }
+  }
+
+  return {
+    contextWindowTokens: DEFAULT_CONTEXT_WINDOW_TOKENS,
+    reservedOutputTokens: DEFAULT_MAX_OUTPUT_TOKENS,
+    safetyMarginTokens: DEFAULT_CONTEXT_SAFETY_MARGIN_TOKENS
+  };
+}
+
+function getWorkspaceInfo(workspace: Workspace): string {
+  return [
+    `name: ${workspace.name}`,
+    `rootPath: ${workspace.rootPath}`,
+    `gitEnabled: ${workspace.gitEnabled ? "true" : "false"}`
+  ].join("\n");
+}
+
+function getContextMessages(
+  input: {
+    conversationId: string;
+    currentUserMessage: string;
+    systemPrompt: string;
+    workspace: Workspace;
+    provider: RuntimeProvider;
+  },
+  db: AgentHubDatabase
+): NonNullable<AgentRunInput["contextMessages"]> {
+  return buildConversationContextForAgentRun(
+    {
+      conversationId: input.conversationId,
+      currentUserMessage: input.currentUserMessage,
+      systemPrompt: input.systemPrompt,
+      workspaceInfo: getWorkspaceInfo(input.workspace),
+      budget: getContextBudget(input.provider, input.workspace.rootPath)
+    },
+    db
+  ).contextMessages;
+}
+
+function buildFallbackPrompt(input: {
+  systemPrompt: string;
+  contextMessages: Array<{ role: string; content: string }>;
+  userMessage: string;
+}): string {
+  const parts = [
+    input.systemPrompt,
+    "你正在继续一个 AgentHub 历史对话，但底层 Provider 原生 session 已失效。",
+    "下面是平台保存的历史消息，请基于这些上下文继续工作。",
+    "不要声称你拥有失效的原生 session 上下文。",
+    "继续执行用户当前请求。",
+    "\n---\n历史消息:"
+  ];
+
+  const historyMessages = [...input.contextMessages];
+  const lastMessage = historyMessages.at(-1);
+  if (lastMessage?.role === "user" && lastMessage.content === input.userMessage) {
+    historyMessages.pop();
+  }
+
+  for (const msg of historyMessages) {
+    parts.push(`[${msg.role}]: ${msg.content}`);
+  }
+
+  parts.push(`\n---\n当前用户请求:\n${input.userMessage}`);
+  return parts.join("\n\n");
+}
+
+function getRuntimeLabel(provider: RuntimeProvider): string {
+  return RUNTIME_PROVIDER_LABELS[provider] ?? provider;
+}
+
+function readDebugDisableStreamForSubAgent(rootPath: string): boolean {
+  try {
+    const resolved = getResolvedConfig(rootPath);
+    return resolved.merged.groupChat?.debugDisableStreamForSubAgent === true;
+  } catch {
+    return false;
+  }
+}
+
+function requestsCodeChanges(message: string): boolean {
+  const text = message.trim();
+  const editIntent =
+    /(?:实现|修复|修改|编辑|生成|新增|添加|删除|移除|重构|改成|改为|替换|创建|写入|调整|优化|补充|代码变更)/i.test(text) ||
+    /\b(?:fix|implement|refactor|edit|modify|change|update|add|remove|delete|create|write|rename)\b/i.test(text);
+  if (!editIntent) {
+    return false;
+  }
+
+  if (
+    /(?:解释|说明|讨论|分析|建议|设计建议|架构讨论|怎么看|为什么)/i.test(text) ||
+    /\b(?:explain|describe|discuss|analyze|analyse|advice|suggest|why|what)\b/i.test(text)
+  ) {
+    return false;
+  }
+
+  return (
+    /(?:代码|文件|组件|页面|按钮|文案|样式|函数|接口|配置|测试|bug|缺陷|报错|README|package\.json|src\/)/i.test(text) ||
+    /\b[\w./-]+\.(?:ts|tsx|js|jsx|css|scss|html|json|md|py|go|rs|java|yaml|yml)\b/i.test(text) ||
+    /(?:实现|修复|新增|删除|重构|创建|写入|代码变更)/i.test(text) ||
+    /\b(?:fix|implement|refactor|create|write|rename)\b/i.test(text)
+  );
+}
+
+function explicitlyNeedsNoChanges(message: string): boolean {
+  return /(?:no_changes_needed|无需修改|不需要修改|没有代码变更|no file changes? needed)/i.test(
+    message
+  );
+}
+
+export type RunWithConversationInput = {
+  workspaceId: string;
+  agentId: string;
+  conversationId?: string;
+  message: string;
+  resume?: boolean;
+  streamId?: string;
+  /** When true, skip saving user message and reply to the conversation (used for group chat sub-agents) */
+  silent?: boolean;
+  mode?: AgentExecutionMode;
+  structuredOutput?: boolean;
+  workspaceContextId?: string;
+  workspaceRootPath?: string;
+  executionScope?: ProviderSessionExecutionScope;
+  dispatchStepId?: string;
+};
+
+export type RunWithConversationResult = RunAgentOutput & {
+  conversationId: string;
+  usedFallback?: boolean;
+};
+
+export async function runAgentWithConversation(
+  input: RunWithConversationInput,
+  db: AgentHubDatabase = getDatabase(),
+  stream?: RunWithConversationStreamSink,
+  injectedAdapter?: AgentAdapter | null
+): Promise<RunWithConversationResult> {
+  // 1. Validate workspace
+  const workspace = getWorkspaceById(input.workspaceId, db);
+  if (!workspace) {
+    throw new Error("Workspace not found.");
+  }
+
+  // 2. Validate agent
+  const agent = getAgentById(input.agentId, db);
+  if (!agent) {
+    throw new Error("Agent not found.");
+  }
+  if (agent.workspaceId !== workspace.id) {
+    throw new Error("Agent does not belong to the workspace.");
+  }
+
+  // 2a. Route orchestrator agents to runMainAgent
+  if (agent.type === "orchestrator") {
+    const conversationId = input.conversationId ?? "";
+    if (!conversationId) {
+      throw new Error("Orchestrator requires an existing conversation.");
+    }
+    const result = await runMainAgent(
+      {
+        workspaceId: workspace.id,
+        conversationId,
+        userMessage: input.message
+      },
+      db
+    );
+    return {
+      ...result,
+      conversationId
+    };
+  }
+
+  const provider = agent.runtimeProvider;
+  const isBuiltin = isBuiltinProvider(provider);
+  const executionMode = input.mode ?? "single_chat";
+  const executionScope =
+    input.executionScope ?? (executionMode === "group_subagent" ? "group_subagent" : "direct");
+  const maxIterations =
+    executionMode === "group_subagent"
+      ? AGENT_EXECUTION_LIMITS.groupSubagentMaxIterations
+      : executionMode === "orchestrator_review"
+        ? AGENT_EXECUTION_LIMITS.orchestratorReviewMaxIterations
+        : AGENT_EXECUTION_LIMITS.singleChatMaxIterations;
+  if (provider === "mock" && !injectedAdapter) {
+    throw new Error("Resume is not supported for mock runtime.");
+  }
+
+  const adapter = injectedAdapter ?? getAdapter(provider);
+  if (!adapter) {
+    throw new Error(`No adapter for provider: ${provider}`);
+  }
+
+  // 3. Find or create conversation
+  let conversation: Conversation;
+  let isNewConversation = false;
+
+  if (input.conversationId) {
+    const found = getConversationById(input.conversationId, db);
+    if (!found) {
+      throw new ConversationNotFoundError(input.conversationId);
+    }
+    if (found.workspaceId !== workspace.id) {
+      throw new Error("Conversation does not belong to the workspace.");
+    }
+    if (found.provider && found.provider !== provider) {
+      throw new ProviderMismatchError(found.provider, provider);
+    }
+    // Auto-set provider on old conversations that don't have one
+    if (!found.provider) {
+      db.prepare("UPDATE conversations SET provider = ? WHERE id = ?")
+        .run(provider, found.id);
+      found.provider = provider;
+    }
+    conversation = found;
+  } else {
+    // Auto-create new conversation
+    conversation = createConversation(
+      {
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        title: input.message.slice(0, 50) || "New Chat",
+        mode: "single",
+        provider
+      },
+      db
+    );
+    isNewConversation = true;
+  }
+
+  const resolvedWorkspace =
+    input.workspaceContextId && input.workspaceRootPath
+      ? {
+          workspaceContextId: input.workspaceContextId,
+          rootPath: input.workspaceRootPath,
+          gitEnabled: workspace.gitEnabled
+        }
+      : resolveExecutionWorkspaceForConversation(conversation.id, agent.id, db);
+  const executionWorkspace: Workspace = {
+    ...workspace,
+    rootPath: resolvedWorkspace.rootPath,
+    gitEnabled: resolvedWorkspace.gitEnabled
+  };
+
+  // 4. Check concurrency lock. Group sub-agents use dispatch-step scope.
+  const runningRun = getRunningAgentRunByScope(
+    {
+      conversationId: conversation.id,
+      agentId: agent.id,
+      executionScope,
+      dispatchStepId: input.dispatchStepId
+    },
+    db
+  );
+  if (runningRun) {
+    throw new ConversationAlreadyRunningError(conversation.id);
+  }
+
+  // 5. Save user message (skip in silent mode for group chat sub-agents)
+  if (!input.silent) {
+    createMessage(
+      {
+        workspaceId: workspace.id,
+        conversationId: conversation.id,
+        senderType: "user",
+        senderId: "local-user",
+        messageType: "text",
+        content: { text: input.message }
+      },
+      db
+    );
+  }
+
+  // 6. Determine resume parameters
+  const shouldResume = input.resume === true && !isNewConversation && !isBuiltin;
+  let providerSessionId: string | undefined;
+  let usedFallback = false;
+
+  if (shouldResume) {
+    const activeSession = getActiveProviderSession(
+      conversation.id,
+      {
+        agentId: agent.id,
+        provider,
+        workspaceContextId: resolvedWorkspace.workspaceContextId,
+        rootPath: executionWorkspace.rootPath,
+        executionScope
+      },
+      db
+    );
+    if (activeSession) {
+      providerSessionId = activeSession.providerSessionId;
+    }
+  }
+
+  // 7. Create agent run snapshot
+  const agentRun = createAgentRun(
+    {
+      conversationId: conversation.id,
+      workspaceId: workspace.id,
+      agentId: agent.id,
+      provider,
+      providerSessionId,
+      rootPath: executionWorkspace.rootPath,
+      workspaceContextId: resolvedWorkspace.workspaceContextId,
+      executionScope,
+      dispatchStepId: input.dispatchStepId,
+      systemPromptSnapshot: agent.systemPrompt,
+      toolPermissionsSnapshot: formatToolPermissions(agent),
+      mode: executionMode,
+      maxIterations
+    },
+    db
+  );
+
+  // 8. Build adapter input
+  // Resolve provider env from config
+  let providerEnv: Record<string, string> | undefined;
+  try {
+    const resolvedConfig = getResolvedConfig(executionWorkspace.rootPath);
+    providerEnv = resolveProviderEnv(agent, resolvedConfig);
+  } catch {
+    // Config resolution failure is non-fatal; adapter uses defaults
+  }
+
+  let adapterInput: AgentRunInput;
+  const baseSystemPrompt = buildEffectiveSystemPrompt(
+    agent,
+    executionMode,
+    maxIterations
+  );
+  const directMemoryContext =
+    executionMode === "single_chat"
+      ? buildDirectAgentMemoryContext(agent.id, conversation.id, undefined, db)
+      : "";
+  const effectiveSystemPrompt = [
+    baseSystemPrompt,
+    directMemoryContext ? `Layered persisted memory:\n${directMemoryContext}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+  const runOptions: AgentRunOptions = {
+    mode: executionMode,
+    maxIterations,
+    conversationId: conversation.id,
+    agentId: agent.id,
+    workspaceRoot: executionWorkspace.rootPath,
+    prompt: input.message,
+    structuredOutput: input.structuredOutput ?? executionMode !== "single_chat",
+    ...(executionMode === "group_subagent" && readDebugDisableStreamForSubAgent(executionWorkspace.rootPath)
+      ? { disableStream: true }
+      : {})
+  };
+
+  if (shouldResume && providerSessionId) {
+    // Try native resume
+    adapterInput = {
+      workspaceId: workspace.id,
+      conversationId: conversation.id,
+      agentId: agent.id,
+      provider,
+      rootPath: executionWorkspace.rootPath,
+      systemPrompt: effectiveSystemPrompt,
+      userMessage: input.message,
+      toolPermissions: [formatToolPermissions(agent)],
+      claudeCodeConfig: agent.claudeCodeConfig,
+      env: providerEnv,
+      runOptions,
+      resume: {
+        enabled: true,
+        providerSessionId
+      }
+    };
+  } else if (shouldResume && !providerSessionId) {
+    // Fallback rebuild - no provider session ID
+    usedFallback = true;
+    const contextMessages = getContextMessages(
+      {
+        conversationId: conversation.id,
+        currentUserMessage: input.message,
+        systemPrompt: effectiveSystemPrompt,
+        workspace: executionWorkspace,
+        provider
+      },
+      db
+    );
+
+    adapterInput = {
+      workspaceId: workspace.id,
+      conversationId: conversation.id,
+      agentId: agent.id,
+      provider,
+      rootPath: executionWorkspace.rootPath,
+      systemPrompt: buildFallbackPrompt({
+        systemPrompt: effectiveSystemPrompt,
+        contextMessages,
+        userMessage: input.message
+      }),
+      userMessage: input.message,
+      toolPermissions: [formatToolPermissions(agent)],
+      claudeCodeConfig: agent.claudeCodeConfig,
+      env: providerEnv,
+      runOptions,
+      resume: {
+        enabled: false,
+        fallbackRebuild: true
+      }
+    };
+  } else {
+    // New session
+    adapterInput = {
+      workspaceId: workspace.id,
+      conversationId: conversation.id,
+      agentId: agent.id,
+      provider,
+      rootPath: executionWorkspace.rootPath,
+      systemPrompt: effectiveSystemPrompt,
+      userMessage: input.message,
+      contextMessages: isBuiltin
+        ? getContextMessages(
+            {
+              conversationId: conversation.id,
+              currentUserMessage: input.message,
+              systemPrompt: effectiveSystemPrompt,
+              workspace: executionWorkspace,
+              provider
+            },
+            db
+          )
+        : undefined,
+      toolPermissions: [formatToolPermissions(agent)],
+      claudeCodeConfig: agent.claudeCodeConfig,
+      env: providerEnv,
+      runOptions,
+      resume: { enabled: false }
+    };
+  }
+
+  // 9. Run adapter with fallback logic
+  let finalUsedFallback = usedFallback;
+  let agentStatus: "available" | "error" | "unavailable" = "available";
+  let replyText = "";
+  let replyThinking = "";
+  let runError: string | undefined;
+  let newProviderSessionId: string | undefined;
+  let structuredResult: unknown;
+  let diffProposalId: string | undefined;
+  let iterationsUsed: number | undefined;
+  let runResultStatus: AgentRunResult["status"] = "completed";
+
+  // Set agent to running
+  try {
+    updateAgentStatusInRepo(agent.id, "running", db);
+  } catch {
+    // ignore
+  }
+
+  try {
+    for await (const event of runAdapterWithFallback(
+      adapter,
+      adapterInput,
+      shouldResume,
+      providerSessionId,
+      conversation,
+      executionWorkspace,
+      input.message,
+      db
+    )) {
+      // Track if fallback was used from the event stream
+      if ("usedFallback" in event && event.usedFallback) {
+        finalUsedFallback = true;
+      }
+
+      if (event.type === "text_delta") {
+        replyText += event.content;
+        stream?.({
+          type: "text_delta",
+          workspaceId: workspace.id,
+          conversationId: conversation.id,
+          agentId: agent.id,
+          text: event.content,
+          usedFallback: finalUsedFallback
+        });
+      } else if (event.type === "reasoning_delta") {
+        // Reasoning text is deliberately excluded from `replyText` so it
+        // does not pollute the SubAgentResult JSON parse for group chat
+        // sub-agents. It is streamed to the UI as a separate channel and
+        // accumulated separately so we can persist it to thinking_markdown
+        // when the assistant message is created at the end of the run.
+        replyThinking += event.content;
+        stream?.({
+          type: "thinking_delta",
+          workspaceId: workspace.id,
+          conversationId: conversation.id,
+          agentId: agent.id,
+          text: event.content
+        });
+      } else if (event.type === "provider_session") {
+        newProviderSessionId = event.providerSessionId;
+      } else if (event.type === "structured_result") {
+        structuredResult = event.result;
+      } else if (event.type === "diff_proposal") {
+        if (
+          typeof event.proposal === "object" &&
+          event.proposal !== null &&
+          "id" in event.proposal &&
+          typeof event.proposal.id === "string"
+        ) {
+          diffProposalId = event.proposal.id;
+        }
+      } else if (event.type === "error") {
+        runError = event.message;
+        agentStatus = "error";
+        runResultStatus = "failed";
+      } else if (event.type === "status") {
+        iterationsUsed = event.iterationsUsed ?? iterationsUsed;
+        if (event.status === "failed") {
+          agentStatus = "error";
+          runResultStatus = "failed";
+        } else if (event.status === "iteration_limit_reached") {
+          agentStatus = "error";
+          runResultStatus = "iteration_limit_reached";
+        } else if (event.status === "waiting_for_permission") {
+          runResultStatus = "waiting_for_permission";
+        } else if (event.status === "cancelled") {
+          runResultStatus = "cancelled";
+        }
+      }
+    }
+  } catch (error) {
+    runError = error instanceof Error ? error.message : "Agent run failed";
+    agentStatus = "error";
+
+    // Check if this was a fallback failure
+    if (error instanceof FallbackRebuildFailedError) {
+      // Still mark the agent run as failed before re-throwing
+      updateAgentRunStatus(agentRun.id, "failed", runError, db);
+      throw error;
+    }
+  } finally {
+    // Always mark the agent run as completed/failed so it doesn't block future runs
+    const currentRun = db
+      .prepare("SELECT status FROM agent_runs WHERE id = ?")
+      .get(agentRun.id) as { status: string } | undefined;
+    if (currentRun?.status === "running") {
+      updateAgentRunStatus(
+        agentRun.id,
+        runError ? "failed" : runResultStatus,
+        runError,
+        db,
+        iterationsUsed
+      );
+    }
+  }
+
+  const hadExplicitNoChanges = explicitlyNeedsNoChanges(replyText);
+  const processedReply = replyText.trim()
+    ? await createDiffProposalFromText(
+        {
+          workspaceId: workspace.id,
+          agentId: agent.id,
+          conversationId: conversation.id,
+          text: replyText,
+          dispatchStepId: input.dispatchStepId
+        },
+        db
+      )
+    : {
+        text: replyText,
+        diffProposals: [],
+        diffMessages: []
+      };
+  replyText = processedReply.text;
+  if (!diffProposalId && processedReply.diffProposals[0]) {
+    diffProposalId = processedReply.diffProposals[0].id;
+  }
+  updateAgentRunRawOutput(agentRun.id, replyText, db);
+
+  if (
+    executionMode === "single_chat" &&
+    runResultStatus === "completed" &&
+    requestsCodeChanges(input.message) &&
+    !diffProposalId &&
+    !hadExplicitNoChanges
+  ) {
+    runResultStatus = "verification_failed";
+    runError =
+      "Provider finished without a valid DiffProposal or an explicit no_changes_needed result.";
+    agentStatus = "error";
+    updateAgentRunStatus(agentRun.id, "verification_failed", runError, db, iterationsUsed);
+  }
+
+  // If we fell back, mark it
+  if (usedFallback || finalUsedFallback) {
+    finalUsedFallback = true;
+    markAgentRunUsedFallback(agentRun.id, db);
+  }
+
+  // 10. Handle provider session ID
+  if (newProviderSessionId) {
+    // Mark old sessions as replaced
+    markActiveSessionsAsReplaced(
+      conversation.id,
+      {
+        agentId: agent.id,
+        provider,
+        workspaceContextId: resolvedWorkspace.workspaceContextId,
+        rootPath: executionWorkspace.rootPath,
+        executionScope
+      },
+      db
+    );
+
+    // Create new provider session mapping
+    createProviderSession(
+      {
+        conversationId: conversation.id,
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        provider,
+        providerSessionId: newProviderSessionId,
+        workspaceContextId: resolvedWorkspace.workspaceContextId,
+        rootPath: executionWorkspace.rootPath,
+        executionScope
+      },
+      db
+    );
+
+    // Update agent run with the session ID
+    updateAgentRunProviderSessionId(agentRun.id, newProviderSessionId, db);
+  }
+
+  // 11. Update agent status
+  try {
+    updateAgentStatusInRepo(agent.id, agentStatus, db);
+  } catch {
+    // ignore
+  }
+
+  // 13. Create reply message (skip saving to conversation in silent mode)
+  const messages: Message[] = [];
+
+  messages.push(...processedReply.diffMessages);
+
+  if (replyText.trim()) {
+    if (!input.silent) {
+      const replyMessage = createMessage(
+        {
+          workspaceId: workspace.id,
+          conversationId: conversation.id,
+          senderType: "agent",
+          senderId: agent.id,
+          messageType: "text",
+          content: { text: replyText }
+        },
+        db
+      );
+      if (replyThinking.length > 0) {
+        appendMessageThinking(replyMessage.id, replyThinking, db);
+      }
+      messages.push(replyMessage);
+    } else {
+      // In silent mode, still return the reply text but don't save to conversation
+      messages.push({
+        id: `silent-${Date.now()}`,
+        workspaceId: workspace.id,
+        conversationId: conversation.id,
+        senderType: "agent",
+        senderId: agent.id,
+        messageType: "text",
+        content: { text: replyText },
+        createdAt: new Date().toISOString(),
+        status: "completed",
+        mentionAgentIds: null,
+        dispatchRunId: null,
+        dispatchStepId: null,
+        replyToMessageId: null,
+        updatedAt: null,
+        metadata: null
+      });
+    }
+  }
+
+  // 14. Add fallback notice if applicable (skip in silent mode)
+  if (finalUsedFallback && !input.silent) {
+    const fallbackNotice = createMessage(
+      {
+        workspaceId: workspace.id,
+        conversationId: conversation.id,
+        senderType: "system",
+        senderId: "agenthub",
+        messageType: "text",
+        content: {
+          text: "底层会话恢复失败，已基于平台历史消息重建上下文并开启新会话。"
+        }
+      },
+      db
+    );
+    messages.push(fallbackNotice);
+  }
+
+  return {
+    agent,
+    status: agentStatus,
+    messages,
+    conversationId: conversation.id,
+    usedFallback: finalUsedFallback,
+    runLog: {
+      id: agentRun.id,
+      workspaceId: workspace.id,
+      agentId: agent.id,
+      conversationId: conversation.id,
+      provider,
+      cwd: executionWorkspace.rootPath,
+      status: runError ? "error" : "exited",
+      stdout: replyText || undefined,
+      createdAt: agentRun.startedAt
+    },
+    runResult: {
+      status: runResultStatus,
+      finalMessage: replyText || undefined,
+      structuredResult,
+      diffProposalId,
+      error: runError,
+      iterationsUsed
+    }
+  };
+}
+
+async function* runAdapterWithFallback(
+  adapter: AgentAdapter,
+  input: AgentRunInput,
+  shouldResume: boolean,
+  providerSessionId: string | undefined,
+  conversation: Conversation,
+  workspace: Workspace,
+  userMessage: string,
+  db: AgentHubDatabase
+): AsyncIterable<AgentEvent & { usedFallback?: boolean }> {
+  try {
+    for await (const event of adapter.run(input)) {
+      yield event;
+    }
+    return;
+  } catch (error) {
+    if (!(error instanceof ResumeFailedError) || !shouldResume) {
+      throw error;
+    }
+    // Resume failed - fall through to fallback
+    console.warn(`Resume failed for conversation ${conversation.id}, falling back to rebuild`);
+  }
+
+  // Mark old session as failed
+  if (providerSessionId) {
+    const activeSession = getActiveProviderSession(
+      conversation.id,
+      {
+        agentId: input.agentId,
+        provider: input.provider,
+        rootPath: input.rootPath
+      },
+      db
+    );
+    if (activeSession) {
+      updateProviderSessionStatus(
+        activeSession.id,
+        "failed",
+        "Resume failed, falling back to rebuild",
+        db
+      );
+    }
+  }
+
+  // Fallback rebuild
+  const contextMessages = getContextMessages(
+    {
+      conversationId: conversation.id,
+      currentUserMessage: userMessage,
+      systemPrompt: input.systemPrompt,
+      workspace,
+      provider: input.provider
+    },
+    db
+  );
+
+  const fallbackInput: AgentRunInput = {
+    ...input,
+    systemPrompt: buildFallbackPrompt({
+      systemPrompt: input.systemPrompt,
+      contextMessages,
+      userMessage
+    }),
+    resume: { enabled: false, fallbackRebuild: true }
+  };
+
+  try {
+    for await (const event of adapter.run(fallbackInput)) {
+      yield { ...event, usedFallback: true };
+    }
+  } catch (fallbackError) {
+    throw new FallbackRebuildFailedError(
+      fallbackError instanceof Error ? fallbackError.message : "Unknown error"
+    );
+  }
+}
+
+// -----------------------------------------------------------------------------
+// Unified event pipeline
+// -----------------------------------------------------------------------------
+//
+// The legacy `runAgentWithConversation` (above) drives the provider adapter
+// directly and accumulates text in memory. The group chat dispatch depends on
+// its structuredResult + diffProposal flow, so we keep it for that caller.
+//
+// The unified pipeline below drives the new `runStreamingAgent` service and
+// exposes the AgentRunEvent protocol to the renderer via IPC. The single-chat
+// renderer uses this path; the group chat path keeps the legacy one.
+
+export type RunWithConversationUnifiedInput = Omit<
+  RunWithConversationInput,
+  "streamId" | "structuredOutput"
+> & {
+  streamId?: string;
+};
+
+export type RunWithConversationUnifiedResult = {
+  conversationId: string;
+  runId: string;
+  assistantMessageId: string;
+  status: "completed" | "failed" | "cancelled";
+  errorMessage?: string;
+  agentId: string;
+};
+
+export async function runAgentWithConversationUnified(
+  input: RunWithConversationUnifiedInput,
+  db: AgentHubDatabase = getDatabase(),
+  streamSink?: (event: AgentRunEvent) => void
+): Promise<RunWithConversationUnifiedResult> {
+  // 1. Validate workspace and agent.
+  const workspace = getWorkspaceById(input.workspaceId, db);
+  if (!workspace) {
+    throw new Error("Workspace not found.");
+  }
+  const agent = getAgentById(input.agentId, db);
+  if (!agent) {
+    throw new Error("Agent not found.");
+  }
+  if (agent.workspaceId !== workspace.id) {
+    throw new Error("Agent does not belong to the workspace.");
+  }
+  if (agent.type === "orchestrator") {
+    // Orchestrator agents keep the legacy orchestrator runtime path. The
+    // unified pipeline is for specialist (sub-agent) single chat.
+    throw new Error(
+      "Orchestrator agents must use the legacy runAgentWithConversation path."
+    );
+  }
+
+  const provider = agent.runtimeProvider;
+  const executionMode = input.mode ?? "single_chat";
+  const executionScope =
+    input.executionScope ??
+    (executionMode === "group_subagent" ? "group_subagent" : "direct");
+  const maxIterations =
+    executionMode === "group_subagent"
+      ? AGENT_EXECUTION_LIMITS.groupSubagentMaxIterations
+      : executionMode === "orchestrator_review"
+        ? AGENT_EXECUTION_LIMITS.orchestratorReviewMaxIterations
+        : AGENT_EXECUTION_LIMITS.singleChatMaxIterations;
+
+  // 2. Find or create conversation.
+  let conversation: Conversation;
+  let isNewConversation = false;
+  if (input.conversationId) {
+    const found = getConversationById(input.conversationId, db);
+    if (!found) {
+      throw new ConversationNotFoundError(input.conversationId);
+    }
+    if (found.workspaceId !== workspace.id) {
+      throw new Error("Conversation does not belong to the workspace.");
+    }
+    if (found.provider && found.provider !== provider) {
+      throw new ProviderMismatchError(found.provider, provider);
+    }
+    if (!found.provider) {
+      db.prepare("UPDATE conversations SET provider = ? WHERE id = ?")
+        .run(provider, found.id);
+      found.provider = provider;
+    }
+    conversation = found;
+  } else {
+    conversation = createConversation(
+      {
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        title: input.message.slice(0, 50) || "New Chat",
+        mode: "single",
+        provider
+      },
+      db
+    );
+    isNewConversation = true;
+  }
+
+  // 3. Resolve execution workspace.
+  const resolvedWorkspace =
+    input.workspaceContextId && input.workspaceRootPath
+      ? {
+          workspaceContextId: input.workspaceContextId,
+          rootPath: input.workspaceRootPath,
+          gitEnabled: workspace.gitEnabled
+        }
+      : resolveExecutionWorkspaceForConversation(conversation.id, agent.id, db);
+  const executionWorkspace: Workspace = {
+    ...workspace,
+    rootPath: resolvedWorkspace.rootPath,
+    gitEnabled: resolvedWorkspace.gitEnabled
+  };
+
+  // 4. Build the effective system prompt.
+  const baseSystemPrompt = buildEffectiveSystemPrompt(
+    agent,
+    executionMode,
+    maxIterations
+  );
+  const directMemoryContext =
+    executionMode === "single_chat"
+      ? buildDirectAgentMemoryContext(agent.id, conversation.id, undefined, db)
+      : "";
+  const effectiveSystemPrompt = [
+    baseSystemPrompt,
+    directMemoryContext ? `Layered persisted memory:\n${directMemoryContext}` : ""
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  // 5. Pre-flight: if the conversation is already running, throw the same
+  //    ConversationAlreadyRunningError that the legacy path uses. The
+  //    streaming service will also check, but doing it up-front lets us
+  //    return a clean error before saving the user message.
+  try {
+    acquireConversationRun({
+      conversationId: conversation.id,
+      agentId: agent.id,
+      db
+    }).release("cancelled");
+  } catch (error) {
+    if (error instanceof ConversationAlreadyRunningError) {
+      throw error;
+    }
+    throw error;
+  }
+
+  // 6. Mark agent as running.
+  try {
+    updateAgentStatusInRepo(agent.id, "running", db);
+  } catch {
+    // ignore
+  }
+
+  // 7. Drive the streaming service.
+  let runId = "";
+  let assistantMessageId = "";
+  let status: "completed" | "failed" | "cancelled" = "completed";
+  let errorMessage: string | undefined;
+  try {
+    for await (const event of runStreamingAgent(
+      {
+        workspaceId: workspace.id,
+        agent,
+        conversationId: conversation.id,
+        rootPath: executionWorkspace.rootPath,
+        workspaceContextId: resolvedWorkspace.workspaceContextId,
+        systemPrompt: effectiveSystemPrompt,
+        userMessage: input.message,
+        executionScope,
+        dispatchStepId: input.dispatchStepId,
+        maxIterations,
+        resume: input.resume,
+        silent: input.silent
+      },
+      db,
+      streamSink as StreamingRunSink | undefined
+    )) {
+      if (!runId) {
+        runId = event.runId;
+      }
+      if (event.type === "message.started" && !assistantMessageId) {
+        assistantMessageId = event.payload.messageId;
+      }
+      if (event.type === "run.completed") {
+        status = event.payload.status;
+      } else if (event.type === "run.failed") {
+        status = "failed";
+        errorMessage = event.payload.message;
+      }
+    }
+  } catch (error) {
+    status = "failed";
+    errorMessage = error instanceof Error ? error.message : "Agent run failed";
+  } finally {
+    try {
+      updateAgentStatusInRepo(
+        agent.id,
+        status === "failed" ? "error" : "available",
+        db
+      );
+    } catch {
+      // ignore
+    }
+  }
+
+  return {
+    conversationId: conversation.id,
+    runId: runId || "",
+    assistantMessageId,
+    status,
+    ...(errorMessage ? { errorMessage } : {}),
+    agentId: agent.id
+  };
+}
+
+export type { AgentRunEvent };

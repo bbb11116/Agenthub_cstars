@@ -1,0 +1,69 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+dist-electron/
+out/
+build/
+
+# Test coverage
+coverage/
+.nyc_output/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Editor / IDE
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+*~
+
+# Local SQLite databases (contain user data + workspace state)
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+
+# Local AgentHub config (contains API keys, provider credentials)
+.agenthub/settings.local.json
+.agenthub/cache/
+agenthub.db
+agenthub.db-shm
+agenthub.db-wal
+
+# Environment files
+.env
+.env.local
+.env.*.local
+
+# Temporary files
+.tmp/
+.tmp-*
+*.tmp
+*.bak
+*.swp
+
+# OS / packaging
+*.dmg
+*.exe
+*.AppImage
+*.deb
+*.rpm
