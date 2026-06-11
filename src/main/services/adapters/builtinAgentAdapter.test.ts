@@ -6,6 +6,7 @@ const {
   callLLMStream,
   callLLMWithToolSupport,
   callLLMStreamWithContinuation,
+  createArtifact,
   executeWebTool,
   loadMainAgentConfig
 } = vi.hoisted(() => ({
@@ -13,6 +14,7 @@ const {
   callLLMStream: vi.fn(),
   callLLMWithToolSupport: vi.fn(),
   callLLMStreamWithContinuation: vi.fn(),
+  createArtifact: vi.fn(),
   executeWebTool: vi.fn(),
   loadMainAgentConfig: vi.fn()
 }));
@@ -26,6 +28,10 @@ vi.mock("../llmRouter", () => ({
   callLLMStream,
   callLLMWithToolSupport,
   callLLMStreamWithContinuation
+}));
+
+vi.mock("../artifactService", () => ({
+  createArtifact
 }));
 
 vi.mock("../webToolService", () => ({
@@ -424,5 +430,380 @@ describe("BuiltinAgentAdapter", () => {
       content: "AgentHub 是一个 agent 工作台。"
     });
     expect(events.at(-1)).toEqual({ type: "status", status: "completed" });
+  });
+
+  it("registers create_artifact when previewArtifact=true and runs the tool call end-to-end", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You produce preview cards.",
+      userMessage: "给我做一个 PPT 大纲",
+      toolPermissions: ["previewArtifact=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "给我做一个 PPT 大纲"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+    const fakeArtifact = {
+      id: "artifact-1",
+      workspaceId: input.workspaceId,
+      conversationId: input.conversationId,
+      agentId: input.agentId,
+      type: "html",
+      title: "PPT 大纲",
+      content: "<h1>Slide 1</h1>",
+      language: "html",
+      version: 1,
+      createdAt: "2026-01-01T00:00:00.000Z"
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport
+      .mockResolvedValueOnce({
+        text: "",
+        toolCalls: [
+          {
+            id: "c1",
+            name: "create_artifact",
+            arguments: {
+              title: "PPT 大纲",
+              content: "<h1>Slide 1</h1>",
+              type: "presentation"
+            }
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        text: "已生成 PPT 大纲预览卡。",
+        toolCalls: []
+      });
+    createArtifact.mockReturnValue(fakeArtifact);
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    const firstCallArgs = callLLMWithToolSupport.mock.calls[0];
+    const passedToolNames = (firstCallArgs[3] as Array<{ name: string }>).map((tool) => tool.name);
+    expect(passedToolNames).toContain("create_artifact");
+
+    expect(createArtifact).toHaveBeenCalledWith(
+      expect.objectContaining({
+        workspaceId: input.workspaceId,
+        conversationId: input.conversationId,
+        agentId: input.agentId,
+        type: "html",
+        title: "PPT 大纲",
+        content: "<h1>Slide 1</h1>",
+        language: "html",
+        render: expect.objectContaining({ mode: "html_iframe", status: "none" })
+      })
+    );
+
+    expect(events).toEqual([
+      { type: "status", status: "running" },
+      {
+        type: "structured_result",
+        result: {
+          toolCalls: [
+            {
+              id: "c1",
+              name: "create_artifact",
+              arguments: {
+                title: "PPT 大纲",
+                content: "<h1>Slide 1</h1>",
+                type: "presentation"
+              }
+            }
+          ]
+        }
+      },
+      {
+        type: "structured_result",
+        result: {
+          artifacts: [
+            {
+              artifactId: "artifact-1",
+              title: "PPT 大纲",
+              type: "html",
+              filePath: undefined,
+              language: "html",
+              sizeBytes: 16,
+              renderStatus: "none"
+            }
+          ]
+        }
+      },
+      {
+        type: "structured_result",
+        result: {
+          toolResults: [
+            {
+              toolCallId: "c1",
+              name: "create_artifact",
+              result: { artifactId: "artifact-1", status: "created" },
+              ok: true
+            }
+          ]
+        }
+      },
+      { type: "text_delta", content: "已生成 PPT 大纲预览卡。" },
+      { type: "status", status: "completed" }
+    ]);
+  });
+
+  it("does not register create_artifact when previewArtifact=false", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You answer questions.",
+      userMessage: "hi",
+      toolPermissions: ["previewArtifact=false", "webSearch=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "hi"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport.mockResolvedValue({
+      text: "ok",
+      toolCalls: []
+    });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    const passedToolNames = (callLLMWithToolSupport.mock.calls[0][3] as Array<{ name: string }>).map(
+      (tool) => tool.name
+    );
+    expect(passedToolNames).not.toContain("create_artifact");
+    expect(passedToolNames).toContain("web_search");
+  });
+
+  it("rejects create_artifact with content over 1MB and does not call createArtifact", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You produce preview cards.",
+      userMessage: "big content",
+      toolPermissions: ["previewArtifact=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "big content"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport
+      .mockResolvedValueOnce({
+        text: "",
+        toolCalls: [
+          {
+            id: "c2",
+            name: "create_artifact",
+            arguments: {
+              title: "too big",
+              content: "x".repeat(1_000_001),
+              type: "html"
+            }
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        text: "抱歉内容太大。",
+        toolCalls: []
+      });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(createArtifact).not.toHaveBeenCalled();
+    const errorResult = events.find(
+      (event) =>
+        event.type === "structured_result" &&
+        Array.isArray((event.result as { toolResults?: unknown[] }).toolResults) &&
+        ((event.result as { toolResults: Array<{ ok: boolean; errorMessage?: string }> })
+          .toolResults[0]?.ok === false)
+    ) as { type: "structured_result"; result: { toolResults: Array<{ ok: boolean; errorMessage?: string }> } };
+    expect(errorResult).toBeDefined();
+    expect(errorResult.result.toolResults[0].errorMessage).toMatch(/exceeds/);
+  });
+
+  it("rejects create_artifact with an out-of-whitelist type", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You produce preview cards.",
+      userMessage: "bad type",
+      toolPermissions: ["previewArtifact=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "bad type"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport
+      .mockResolvedValueOnce({
+        text: "",
+        toolCalls: [
+          {
+            id: "c3",
+            name: "create_artifact",
+            arguments: {
+              title: "bad",
+              content: "stuff",
+              type: "pdf"
+            }
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        text: "ok",
+        toolCalls: []
+      });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(createArtifact).not.toHaveBeenCalled();
+    const errorResult = events.find(
+      (event) =>
+        event.type === "structured_result" &&
+        Array.isArray((event.result as { toolResults?: unknown[] }).toolResults) &&
+        ((event.result as { toolResults: Array<{ ok: boolean; errorMessage?: string }> })
+          .toolResults[0]?.ok === false)
+    ) as { type: "structured_result"; result: { toolResults: Array<{ ok: boolean; errorMessage?: string }> } };
+    expect(errorResult).toBeDefined();
+    expect(errorResult.result.toolResults[0].errorMessage).toMatch(/html, document, presentation/);
+  });
+
+  it("rejects create_artifact with missing or non-string content", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You produce preview cards.",
+      userMessage: "missing",
+      toolPermissions: ["previewArtifact=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "missing"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport
+      .mockResolvedValueOnce({
+        text: "",
+        toolCalls: [
+          {
+            id: "c4",
+            name: "create_artifact",
+            arguments: {
+              title: "missing content",
+              type: "html"
+            }
+          }
+        ]
+      })
+      .mockResolvedValueOnce({
+        text: "ok",
+        toolCalls: []
+      });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    expect(createArtifact).not.toHaveBeenCalled();
   });
 });

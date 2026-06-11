@@ -16,9 +16,10 @@ import {
   createWebToolCall,
   executeWebTool,
   WEB_TOOL_DEFINITIONS,
-  type WebToolCall,
-  type WebToolName
+  type WebToolCall
 } from "../webToolService";
+import { createArtifact } from "../artifactService";
+import type { Artifact } from "../../../shared/artifact";
 
 function buildMessages(input: AgentRunInput): ChatMessage[] {
   const messages = (input.contextMessages ?? []).map((message) => ({
@@ -40,11 +41,16 @@ function buildMessages(input: AgentRunInput): ChatMessage[] {
   return messages;
 }
 
-function hasToolPermission(input: AgentRunInput, toolName: "webSearch" | "webFetch"): boolean {
+function hasToolPermission(
+  input: AgentRunInput,
+  toolName: "webSearch" | "webFetch" | "previewArtifact"
+): boolean {
   const normalized = input.toolPermissions.join(",").toLowerCase();
   const aliases = toolName === "webSearch"
     ? new Set(["websearch", "web_search"])
-    : new Set(["webfetch", "web_fetch"]);
+    : toolName === "webFetch"
+    ? new Set(["webfetch", "web_fetch"])
+    : new Set(["previewartifact", "preview_artifact"]);
   return normalized
     .split(",")
     .map((entry) => entry.trim())
@@ -53,6 +59,54 @@ function hasToolPermission(input: AgentRunInput, toolName: "webSearch" | "webFet
       return aliases.has(key) && value === "true";
     });
 }
+
+type AgentToolName = "web_search" | "web_fetch" | "create_artifact";
+
+type AgentToolCall = {
+  id: string;
+  name: AgentToolName;
+  arguments: Record<string, unknown>;
+};
+
+type CreateArtifactArgs = {
+  title: string;
+  content: string;
+  type: "html" | "document" | "presentation";
+};
+
+const CREATE_ARTIFACT_TOOL_DEFINITION: LLMToolDefinition = {
+  name: "create_artifact",
+  description: [
+    "Create an ephemeral HTML / Document / Presentation preview card in the current chat.",
+    "The artifact is stored in the database only — it does NOT write to the workspace file system.",
+    "Use this for drafts, outlines, formatted content the user wants to inspect, or visual deliverables.",
+    "For code/text file modifications to the workspace, continue to emit SEARCH/REPLACE DiffProposal blocks; the user must Apply them before files are written."
+  ].join(" "),
+  inputSchema: {
+    type: "object",
+    properties: {
+      title: {
+        type: "string",
+        description: "Human-readable title shown above the preview card."
+      },
+      content: {
+        type: "string",
+        description:
+          "The artifact body. For html/document/presentation types, write semantic HTML; the renderer will display it in an iframe."
+      },
+      type: {
+        type: "string",
+        enum: ["html", "document", "presentation"],
+        description:
+          "Artifact category. All three render via the HTML iframe pipeline (no external renderer required)."
+      }
+    },
+    required: ["title", "content", "type"],
+    additionalProperties: false
+  }
+};
+
+const CREATE_ARTIFACT_MAX_CONTENT_BYTES = 1_000_000;
 
 function getWebToolDefinitions(input: AgentRunInput): LLMToolDefinition[] {
   const tools: LLMToolDefinition[] = [];
@@ -65,32 +119,77 @@ function getWebToolDefinitions(input: AgentRunInput): LLMToolDefinition[] {
   return tools;
 }
 
-function getWebToolNames(tools: LLMToolDefinition[]): Set<WebToolName> {
+function getCreateArtifactToolDefinition(input: AgentRunInput): LLMToolDefinition[] {
+  return hasToolPermission(input, "previewArtifact")
+    ? [CREATE_ARTIFACT_TOOL_DEFINITION]
+    : [];
+}
+
+function getAgentToolNames(tools: LLMToolDefinition[]): Set<AgentToolName> {
   return new Set(
     tools
       .map((tool) => tool.name)
-      .filter((name): name is WebToolName => name === "web_search" || name === "web_fetch")
+      .filter((name): name is AgentToolName =>
+        name === "web_search" || name === "web_fetch" || name === "create_artifact"
+      )
   );
 }
 
-function buildWebToolSystemPrompt(systemPrompt: string, nativeToolCalling: boolean): string {
-  const toolPolicy = nativeToolCalling
-    ? [
-        "Web access policy:",
-        "Use the runtime web_search tool for current or external facts that are not in the conversation.",
-        "Use web_fetch only when you need details from a specific public URL.",
-        "If you cannot emit a native tool call, output exactly one JSON object instead: {\"action\":\"web_search\",\"query\":\"...\",\"maxResults\":5} or {\"action\":\"web_fetch\",\"url\":\"https://example.com\",\"maxChars\":12000}.",
-        "Do not claim you searched or fetched a page unless a tool result was provided.",
-        "After tool results are provided, answer normally and include source URLs when they support the answer."
-      ]
-    : [
-        "Web access policy:",
-        "This model API does not expose native tool calls. If you need web access, output exactly one JSON object and no prose.",
-        "For search: {\"action\":\"web_search\",\"query\":\"...\",\"maxResults\":5}.",
-        "For page fetch: {\"action\":\"web_fetch\",\"url\":\"https://example.com\",\"maxChars\":12000}.",
-        "After a tool result is provided, answer normally and include source URLs when they support the answer.",
-        "Do not claim you searched or fetched a page unless a tool result was provided."
-      ];
+function parseCreateArtifactArgs(raw: unknown): CreateArtifactArgs {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    throw new Error("create_artifact arguments must be an object");
+  }
+  const record = raw as Record<string, unknown>;
+  const title = record.title;
+  const content = record.content;
+  const type = record.type;
+  if (typeof title !== "string" || title.trim().length === 0) {
+    throw new Error("create_artifact requires a non-empty title");
+  }
+  if (typeof content !== "string") {
+    throw new Error("create_artifact requires content to be a string");
+  }
+  if (type !== "html" && type !== "document" && type !== "presentation") {
+    throw new Error("create_artifact type must be one of: html, document, presentation");
+  }
+  return { title, content, type };
+}
+
+function buildWebToolSystemPrompt(
+  systemPrompt: string,
+  nativeToolCalling: boolean,
+  artifactToolEnabled: boolean
+): string {
+  const toolPolicy: string[] = [];
+  if (artifactToolEnabled && nativeToolCalling) {
+    toolPolicy.push(
+      "Artifact policy:",
+      "When the user asks for a preview, a draft, an outline, a slide deck, a formatted document, a demo, a mock-up, or any 'show me what it would look like' deliverable, you MUST use the create_artifact tool. Do NOT emit a SEARCH/REPLACE block for those requests.",
+      "create_artifact produces an HTML preview card directly in chat. Pass title (string), content (HTML string), and type (one of: html, document, presentation). The type value only shapes the preview; all three render via the HTML iframe pipeline.",
+      "create_artifact stores the content in the database only — it does NOT modify the workspace. If the user wants a real file on disk, they will say so explicitly (e.g. 'save to repo', 'commit', 'create file X').",
+      "SEARCH/REPLACE DiffProposal blocks are reserved for actual workspace file modifications the user wants persisted to disk. Do not use them as a substitute for create_artifact.",
+      "Never paste the full HTML / document body into plain text. Always call create_artifact so the user sees a preview card."
+    );
+  }
+  if (nativeToolCalling) {
+    toolPolicy.push(
+      "Web access policy:",
+      "Use the runtime web_search tool for current or external facts that are not in the conversation.",
+      "Use web_fetch only when you need details from a specific public URL.",
+      "If you cannot emit a native tool call, output exactly one JSON object instead: {\"action\":\"web_search\",\"query\":\"...\",\"maxResults\":5} or {\"action\":\"web_fetch\",\"url\":\"https://example.com\",\"maxChars\":12000}.",
+      "Do not claim you searched or fetched a page unless a tool result was provided.",
+      "After tool results are provided, answer normally and include source URLs when they support the answer."
+    );
+  } else {
+    toolPolicy.push(
+      "Web access policy:",
+      "This model API does not expose native tool calls. If you need web access, output exactly one JSON object and no prose.",
+      "For search: {\"action\":\"web_search\",\"query\":\"...\",\"maxResults\":5}.",
+      "For page fetch: {\"action\":\"web_fetch\",\"url\":\"https://example.com\",\"maxChars\":12000}.",
+      "After a tool result is provided, answer normally and include source URLs when they support the answer.",
+      "Do not claim you searched or fetched a page unless a tool result was provided."
+    );
+  }
   return [systemPrompt, toolPolicy.join("\n")].join("\n\n");
 }
 
@@ -102,7 +201,7 @@ function stripJsonFence(text: string): string {
 
 function parseFallbackToolCall(
   text: string,
-  allowedTools: Set<WebToolName>
+  allowedTools: Set<AgentToolName>
 ): WebToolCall | null {
   const candidate = stripJsonFence(text);
   if (!candidate.startsWith("{") || !candidate.endsWith("}")) {
@@ -132,18 +231,20 @@ function parseFallbackToolCall(
 
 function normalizeNativeToolCalls(
   toolCalls: LLMToolCall[],
-  allowedTools: Set<WebToolName>
-): WebToolCall[] {
+  allowedTools: Set<AgentToolName>
+): AgentToolCall[] {
   return toolCalls
-    .filter((toolCall) => allowedTools.has(toolCall.name as WebToolName))
+    .filter((toolCall): toolCall is LLMToolCall =>
+      allowedTools.has(toolCall.name as AgentToolName)
+    )
     .map((toolCall) => ({
       id: toolCall.id,
-      name: toolCall.name as WebToolName,
+      name: toolCall.name as AgentToolName,
       arguments: toolCall.arguments
     }));
 }
 
-function createToolResultMessage(call: WebToolCall, result: unknown, ok: boolean, errorMessage?: string): ChatMessage {
+function createToolResultMessage(call: AgentToolCall, result: unknown, ok: boolean, errorMessage?: string): ChatMessage {
   return {
     role: "user",
     content: [
@@ -158,7 +259,7 @@ function createToolResultMessage(call: WebToolCall, result: unknown, ok: boolean
         2
       ),
       "",
-      "Use this tool result to continue. If more web information is needed, request one more tool call; otherwise answer the user directly."
+      "Use this tool result to continue. If more information is needed, request another tool call; otherwise answer the user directly."
     ].join("\n")
   };
 }
@@ -182,8 +283,10 @@ export class BuiltinAgentAdapter implements AgentAdapter {
       const config = loadMainAgentConfig(input.rootPath);
       const messages = buildMessages(input);
       const webTools = getWebToolDefinitions(input);
-      if (webTools.length > 0) {
-        yield* this.runWithWebTools(input, config, messages, webTools);
+      const artifactTools = getCreateArtifactToolDefinition(input);
+      const allTools = [...webTools, ...artifactTools];
+      if (allTools.length > 0) {
+        yield* this.runWithTools(input, config, messages, allTools, webTools, artifactTools);
         return;
       }
 
@@ -299,29 +402,36 @@ export class BuiltinAgentAdapter implements AgentAdapter {
     }
   }
 
-  private async *runWithWebTools(
+  private async *runWithTools(
     input: AgentRunInput,
     config: ReturnType<typeof loadMainAgentConfig>,
     initialMessages: ChatMessage[],
-    webTools: LLMToolDefinition[]
+    allTools: LLMToolDefinition[],
+    webTools: LLMToolDefinition[],
+    artifactTools: LLMToolDefinition[]
   ): AsyncIterable<AgentEvent> {
-    const allowedTools = getWebToolNames(webTools);
+    const allowedTools = getAgentToolNames(allTools);
+    const webToolNames = getAgentToolNames(webTools);
     const maxIterations = Math.max(1, Math.min(input.runOptions?.maxIterations ?? 6, 12));
     const messages = [...initialMessages];
     let useNativeToolCalling = config.toolCalling !== "unsupported";
 
-    console.info("[AgentHub] BuiltinAgentAdapter web tools enabled", {
+    console.info("[AgentHub] BuiltinAgentAdapter tools enabled", {
       agentId: input.agentId,
       providerId: config.providerId,
       toolCalling: config.toolCalling ?? "unknown",
-      tools: webTools.map((tool) => tool.name),
+      tools: allTools.map((tool) => tool.name),
       maxIterations
     });
 
     for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      const systemPrompt = buildWebToolSystemPrompt(input.systemPrompt, useNativeToolCalling);
+      const systemPrompt = buildWebToolSystemPrompt(
+        input.systemPrompt,
+        useNativeToolCalling,
+        artifactTools.length > 0
+      );
       let text = "";
-      let toolCalls: WebToolCall[] = [];
+      let toolCalls: AgentToolCall[] = [];
 
       if (useNativeToolCalling) {
         try {
@@ -329,8 +439,8 @@ export class BuiltinAgentAdapter implements AgentAdapter {
             config,
             systemPrompt,
             messages,
-            webTools,
-            { toolDefinitions: webTools }
+            allTools,
+            { toolDefinitions: allTools }
           );
           text = response.text;
           toolCalls = normalizeNativeToolCalls(response.toolCalls, allowedTools);
@@ -347,12 +457,12 @@ export class BuiltinAgentAdapter implements AgentAdapter {
         }
       } else {
         text = await callLLM(config, systemPrompt, messages, {
-          toolDefinitions: webTools
+          toolDefinitions: allTools
         });
       }
 
       if (toolCalls.length === 0) {
-        const fallbackToolCall = parseFallbackToolCall(text, allowedTools);
+        const fallbackToolCall = parseFallbackToolCall(text, webToolNames);
         if (fallbackToolCall) {
           toolCalls = [fallbackToolCall];
         }
@@ -371,7 +481,7 @@ export class BuiltinAgentAdapter implements AgentAdapter {
         role: "assistant",
         content: text.trim().length > 0
           ? text
-          : `Requested web tools: ${toolCalls.map((toolCall) => toolCall.name).join(", ")}`
+          : `Requested tools: ${toolCalls.map((toolCall) => toolCall.name).join(", ")}`
       });
 
       for (const toolCall of toolCalls) {
@@ -388,8 +498,14 @@ export class BuiltinAgentAdapter implements AgentAdapter {
           }
         };
 
+        if (toolCall.name === "create_artifact") {
+          yield* this.handleCreateArtifactToolCall(input, toolCall, messages);
+          continue;
+        }
+
+        const webCall = toolCall as WebToolCall;
         try {
-          const result = await executeWebTool(toolCall, input.env);
+          const result = await executeWebTool(webCall, input.env);
           yield {
             type: "structured_result",
             result: {
@@ -427,8 +543,129 @@ export class BuiltinAgentAdapter implements AgentAdapter {
 
     yield {
       type: "error",
-      message: `Agent reached web tool iteration limit (${maxIterations}) before producing a final answer.`
+      message: `Agent reached tool iteration limit (${maxIterations}) before producing a final answer.`
     };
     yield { type: "status", status: "iteration_limit_reached", iterationsUsed: maxIterations };
+  }
+
+  private async *handleCreateArtifactToolCall(
+    input: AgentRunInput,
+    toolCall: AgentToolCall,
+    messages: ChatMessage[]
+  ): AsyncGenerator<AgentEvent, void, void> {
+    let args: CreateArtifactArgs;
+    try {
+      args = parseCreateArtifactArgs(toolCall.arguments);
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      yield {
+        type: "structured_result",
+        result: {
+          toolResults: [
+            {
+              toolCallId: toolCall.id,
+              name: toolCall.name,
+              result: null,
+              ok: false,
+              errorMessage
+            }
+          ]
+        }
+      };
+      messages.push(createToolResultMessage(toolCall, null, false, errorMessage));
+      return;
+    }
+
+    if (args.content.length > CREATE_ARTIFACT_MAX_CONTENT_BYTES) {
+      const errorMessage = `create_artifact content exceeds ${CREATE_ARTIFACT_MAX_CONTENT_BYTES} bytes`;
+      yield {
+        type: "structured_result",
+        result: {
+          toolResults: [
+            {
+              toolCallId: toolCall.id,
+              name: toolCall.name,
+              result: null,
+              ok: false,
+              errorMessage
+            }
+          ]
+        }
+      };
+      messages.push(createToolResultMessage(toolCall, null, false, errorMessage));
+      return;
+    }
+
+    let artifact: Artifact;
+    try {
+      const created = createArtifact({
+        workspaceId: input.workspaceId,
+        conversationId: input.conversationId,
+        agentId: input.agentId,
+        type: "html",
+        title: args.title,
+        content: args.content,
+        language: "html",
+        render: {
+          status: "none",
+          mode: "html_iframe",
+          source: "content",
+          assets: []
+        }
+      });
+      artifact = created;
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      yield {
+        type: "structured_result",
+        result: {
+          toolResults: [
+            {
+              toolCallId: toolCall.id,
+              name: toolCall.name,
+              result: null,
+              ok: false,
+              errorMessage
+            }
+          ]
+        }
+      };
+      messages.push(createToolResultMessage(toolCall, null, false, errorMessage));
+      return;
+    }
+
+    yield {
+      type: "structured_result",
+      result: {
+        artifacts: [
+          {
+            artifactId: artifact.id,
+            title: artifact.title,
+            type: "html",
+            filePath: artifact.filePath,
+            language: artifact.language,
+            sizeBytes: Buffer.byteLength(artifact.content, "utf8"),
+            renderStatus: "none"
+          }
+        ]
+      }
+    };
+
+    yield {
+      type: "structured_result",
+      result: {
+        toolResults: [
+          {
+            toolCallId: toolCall.id,
+            name: toolCall.name,
+            result: { artifactId: artifact.id, status: "created" },
+            ok: true
+          }
+        ]
+      }
+    };
+    messages.push(
+      createToolResultMessage(toolCall, { artifactId: artifact.id, status: "created" }, true)
+    );
   }
 }
