@@ -42,6 +42,17 @@ function buildUnifiedDiff(filePath: string, oldLine: string, newLine: string): s
   ].join("\n");
 }
 
+function buildAddedFileUnifiedDiff(filePath: string, content: string): string {
+  const lines = content.split("\n");
+  if (lines[lines.length - 1] === "") lines.pop();
+  return [
+    "--- /dev/null",
+    `+++ b/${filePath}`,
+    `@@ -0,0 +1,${lines.length} @@`,
+    ...lines.map((line) => `+${line}`)
+  ].join("\n");
+}
+
 function makeEvent<T extends AgentRunEvent["type"]>(
   runId: string,
   conversationId: string,
@@ -352,5 +363,186 @@ describe("streamingRunService diff.proposal handling", () => {
     expect(
       getMessagesByConversation(conversation.id).filter((m) => m.messageType === "diff_card")
     ).toEqual([]);
+  });
+
+  it("auto-creates an artifact_preview when the LLM adds an .html file via diff.proposal", async () => {
+    const rootPath = createTempRoot();
+    initializeDatabase({ dbPath: path.join(rootPath, "agenthub.db") });
+    const { workspace } = await createWorkspaceFromFolder({
+      rootPath,
+      mainAgentRuntimeProvider: "mock"
+    });
+    const { agent, conversation } = createSubAgentManually({
+      workspaceId: workspace.id,
+      name: "Preview Agent",
+      provider: "mock",
+      description: "Produce preview HTML."
+    });
+
+    const filePath = "previews/intro.html";
+    const htmlContent = "<h1>Slide 1</h1>\n<p>hello</p>";
+    const unifiedDiff = buildAddedFileUnifiedDiff(filePath, htmlContent);
+
+    const adapter = fakeAdapter(async function* (input) {
+      const messageId = `msg-${input.runId}`;
+      yield makeEvent(input.runId, input.conversationId, 0, "message.started", { messageId });
+      yield makeEvent(input.runId, input.conversationId, 1, "diff.proposal", {
+        proposalId: `prop-${input.runId}`,
+        messageId,
+        files: [{ path: filePath, status: "added", unifiedDiff }]
+      });
+      yield makeEvent(input.runId, input.conversationId, 2, "message.completed", { messageId });
+      yield makeEvent(input.runId, input.conversationId, 3, "run.completed", {
+        messageId,
+        status: "completed"
+      });
+    });
+
+    await drainRun({
+      workspaceId: workspace.id,
+      agent,
+      conversationId: conversation.id,
+      rootPath,
+      workspaceContextId: null,
+      systemPrompt: "test",
+      userMessage: "make a preview",
+      maxIterations: 1,
+      silent: true,
+      adapter
+    });
+
+    const messages = getMessagesByConversation(conversation.id);
+    const assistantMessage = messages.find(
+      (m) => m.senderType === "agent" && m.messageType === "text"
+    );
+    expect(assistantMessage).toBeDefined();
+    const artifacts = getArtifactsByMessage(assistantMessage!.id);
+    const previewArtifact = artifacts.find((a) => a.type === "artifact_preview");
+    expect(previewArtifact).toBeDefined();
+    const payload = previewArtifact!.payload as {
+      title: string;
+      artifactType: string;
+      renderMode: string;
+      filePath: string;
+    };
+    expect(payload.title).toBe(filePath);
+    expect(payload.artifactType).toBe("html");
+    expect(payload.renderMode).toBe("html_iframe");
+    expect(payload.filePath).toBe(filePath);
+  });
+
+  it("does not auto-create an artifact_preview for modified HTML files (only added files)", async () => {
+    const rootPath = createTempRoot();
+    const filePath = "src/existing.html";
+    const absoluteFile = path.join(rootPath, filePath);
+    fs.mkdirSync(path.dirname(absoluteFile), { recursive: true });
+    fs.writeFileSync(absoluteFile, "<p>old</p>\n", "utf8");
+
+    initializeDatabase({ dbPath: path.join(rootPath, "agenthub.db") });
+    const { workspace } = await createWorkspaceFromFolder({
+      rootPath,
+      mainAgentRuntimeProvider: "mock"
+    });
+    const { agent, conversation } = createSubAgentManually({
+      workspaceId: workspace.id,
+      name: "Editor Agent",
+      provider: "mock",
+      description: "Edit files."
+    });
+
+    const adapter = fakeAdapter(async function* (input) {
+      const messageId = `msg-${input.runId}`;
+      yield makeEvent(input.runId, input.conversationId, 0, "message.started", { messageId });
+      yield makeEvent(input.runId, input.conversationId, 1, "diff.proposal", {
+        proposalId: `prop-${input.runId}`,
+        messageId,
+        files: [
+          { path: filePath, status: "modified", unifiedDiff: buildUnifiedDiff(filePath, "<p>old</p>", "<p>new</p>") }
+        ]
+      });
+      yield makeEvent(input.runId, input.conversationId, 2, "message.completed", { messageId });
+      yield makeEvent(input.runId, input.conversationId, 3, "run.completed", {
+        messageId,
+        status: "completed"
+      });
+    });
+
+    await drainRun({
+      workspaceId: workspace.id,
+      agent,
+      conversationId: conversation.id,
+      rootPath,
+      workspaceContextId: null,
+      systemPrompt: "test",
+      userMessage: "edit",
+      maxIterations: 1,
+      silent: true,
+      adapter
+    });
+
+    const messages = getMessagesByConversation(conversation.id);
+    const assistantMessage = messages.find(
+      (m) => m.senderType === "agent" && m.messageType === "text"
+    );
+    expect(assistantMessage).toBeDefined();
+    const artifacts = getArtifactsByMessage(assistantMessage!.id);
+    const previewArtifact = artifacts.find((a) => a.type === "artifact_preview");
+    expect(previewArtifact).toBeUndefined();
+  });
+
+  it("does not auto-create an artifact_preview for added non-HTML files", async () => {
+    const rootPath = createTempRoot();
+    initializeDatabase({ dbPath: path.join(rootPath, "agenthub.db") });
+    const { workspace } = await createWorkspaceFromFolder({
+      rootPath,
+      mainAgentRuntimeProvider: "mock"
+    });
+    const { agent, conversation } = createSubAgentManually({
+      workspaceId: workspace.id,
+      name: "Code Agent",
+      provider: "mock",
+      description: "Write code."
+    });
+
+    const filePath = "src/util.py";
+    const content = "def hello():\n    return 1\n";
+    const unifiedDiff = buildAddedFileUnifiedDiff(filePath, content);
+
+    const adapter = fakeAdapter(async function* (input) {
+      const messageId = `msg-${input.runId}`;
+      yield makeEvent(input.runId, input.conversationId, 0, "message.started", { messageId });
+      yield makeEvent(input.runId, input.conversationId, 1, "diff.proposal", {
+        proposalId: `prop-${input.runId}`,
+        messageId,
+        files: [{ path: filePath, status: "added", unifiedDiff }]
+      });
+      yield makeEvent(input.runId, input.conversationId, 2, "message.completed", { messageId });
+      yield makeEvent(input.runId, input.conversationId, 3, "run.completed", {
+        messageId,
+        status: "completed"
+      });
+    });
+
+    await drainRun({
+      workspaceId: workspace.id,
+      agent,
+      conversationId: conversation.id,
+      rootPath,
+      workspaceContextId: null,
+      systemPrompt: "test",
+      userMessage: "write util",
+      maxIterations: 1,
+      silent: true,
+      adapter
+    });
+
+    const messages = getMessagesByConversation(conversation.id);
+    const assistantMessage = messages.find(
+      (m) => m.senderType === "agent" && m.messageType === "text"
+    );
+    expect(assistantMessage).toBeDefined();
+    const artifacts = getArtifactsByMessage(assistantMessage!.id);
+    const previewArtifact = artifacts.find((a) => a.type === "artifact_preview");
+    expect(previewArtifact).toBeUndefined();
   });
 });

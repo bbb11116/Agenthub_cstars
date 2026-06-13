@@ -371,8 +371,7 @@ function buildStateFromTree(
   const preferredAgentId = preferredNavigation.activeAgentId ?? state.activeAgentId;
   const activeAgentId = getActiveAgentId(
     activeAgents,
-    preferredAgentId,
-    state.contacts
+    preferredAgentId
   );
   const activeConversations = activeAgentId ? conversationsByAgent[activeAgentId] ?? [] : [];
   const preferredConversationId = preferredNavigation.activeConversationId ?? state.activeConversationId;
@@ -1325,8 +1324,20 @@ function openGroupContact(conversationId: string): void {
 }
 
 async function openDirectChatForAgent(agentId: string): Promise<void> {
-  if (state.activeAgentId !== agentId) {
-    setState({ activeAgentId: agentId, activeConversationId: null });
+  const agent =
+    Object.values(state.agentsByWorkspace)
+      .flat()
+      .find((candidate) => candidate.id === agentId) ??
+    state.contacts.find((candidate) => candidate.id === agentId) ??
+    null;
+  const workspaceId = agent?.workspaceId ?? state.activeWorkspaceId;
+
+  if (state.activeAgentId !== agentId || state.activeWorkspaceId !== workspaceId) {
+    setState({
+      activeWorkspaceId: workspaceId,
+      activeAgentId: agentId,
+      activeConversationId: null
+    });
   }
   setNavigationSection("chats");
   await ensureDirectConversationForActiveAgent();
@@ -1387,6 +1398,8 @@ async function ensureDirectConversationForActiveAgent(): Promise<void> {
   try {
     const real = await getApi().conversation.findOrCreateDirectConversationForAgent(agentId);
     setState({
+      activeWorkspaceId: real.workspaceId,
+      activeAgentId: real.agentId,
       chats: state.chats.map((candidate) => (candidate.id === placeholderId ? real : candidate)),
       activeConversationId:
         state.activeConversationId === placeholderId ? real.id : state.activeConversationId

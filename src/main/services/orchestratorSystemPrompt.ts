@@ -84,6 +84,15 @@ ${SR_R}
 
 当用户要求创建 .docx、.pptx、.pdf 等二进制文档格式时，**仍然使用 SEARCH/REPLACE 块**，但 REPLACE 块内写**完整 HTML 内容**（不是二进制）。AgentHub 会在用户确认 Apply 后自动通过 LibreOffice 把 HTML 转换为目标格式。
 
+### PPT / 幻灯片 / slide deck 的 HTML 布局要求
+
+如果用户要求创建 PPT、幻灯片、演示稿、slide deck、\`.pptx\`、\`.ppt\` 或 \`.odp\`：
+- 产出一个完整 HTML 文档，并用 SEARCH/REPLACE 新建目标文件；不要只把 HTML 贴在普通 Markdown 代码块里。
+- HTML 必须使用 16:9 固定画布：\`html, body { margin: 0; padding: 0; width: 1920px; min-width: 1920px; }\`，每页使用 \`section.slide { width: 1920px; height: 1080px; margin: 0; padding: 0; box-sizing: border-box; overflow: hidden; }\`。
+- 所有 slide 按页面顺序纵向堆叠；不要添加 JavaScript 翻页、按钮、键盘事件、点击区域、页码控制器或其他交互导航。
+- 不要使用 \`max-width\` 外层容器、居中窄版页面、A4/Letter 文档样式、\`body margin\` 或会让 slide 靠左且右侧留白的布局。
+- 每一页的主要背景和布局容器都必须铺满 1920×1080 画布；内容边距应写在 slide 内部元素上，而不是写在 \`body\` 或窄版 wrapper 上。
+
 **格式与普通新建文件完全一致**——filePath 写目标路径（如 \`report.docx\`），SEARCH 块为空，REPLACE 块内放 HTML：
 
 \`\`\`

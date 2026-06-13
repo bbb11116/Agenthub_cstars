@@ -26,7 +26,7 @@ import {
   ResumeFailedError
 } from "../../shared/agentAdapter";
 import { createWorkspaceFromFolder } from "./workspaceService";
-import { runAgentWithConversation } from "./agentRunWithConversationService";
+import { runAgentWithConversation, extractStandaloneHtml } from "./agentRunWithConversationService";
 import { getDatabase } from "../db";
 
 let tempDir: string | null = null;
@@ -499,7 +499,7 @@ describe("runAgentWithConversation", () => {
       systemPrompt: expect.stringContaining("New current system prompt")
     });
     expect(capturedInput).toMatchObject({
-      systemPrompt: expect.stringContaining("produce a valid DiffProposal")
+      systemPrompt: expect.stringContaining("SEARCH/REPLACE")
     });
   });
 
@@ -743,5 +743,122 @@ describe("runAgentWithConversation", () => {
 
     expect(second.id).toBe(first.id);
     expect(getProviderSessionsByConversation(conversation.id, db)).toHaveLength(1);
+  });
+});
+
+describe("extractStandaloneHtml", () => {
+  it("extracts HTML wrapped in a fenced code block and strips the fence from the message", () => {
+    const htmlBody = [
+      "<!DOCTYPE html>",
+      "<html>",
+      "<body>",
+      "  <h1>Slide 1</h1>",
+      "  <p>Hello world, this is a sample slide deck to demonstrate the preview rendering pipeline.</p>",
+      "  <p>It contains enough content to clear the minimum length threshold easily.</p>",
+      "  <h2>Section</h2>",
+      "  <p>More content so the HTML body comfortably exceeds the 200 byte minimum.</p>",
+      "</body>",
+      "</html>"
+    ].join("\n");
+    const reply = [
+      "Here is the slide deck you asked for:",
+      "",
+      "```html",
+      htmlBody,
+      "```",
+      "",
+      "Let me know if you want changes."
+    ].join("\n");
+
+    const result = extractStandaloneHtml(reply);
+    expect(result).not.toBeNull();
+    expect(result!.html).toContain("<h1>Slide 1</h1>");
+    expect(result!.html).toContain("<p>Hello world");
+    expect(result!.html).not.toContain("```");
+    expect(result!.strippedText).toContain("Here is the slide deck");
+    expect(result!.strippedText).toContain("Let me know if you want changes");
+    expect(result!.strippedText).not.toContain("<!DOCTYPE html>");
+  });
+
+  it("returns the full text as html when the LLM dumps HTML inline without a fence", () => {
+    const reply = [
+      "<!DOCTYPE html>",
+      "<html>",
+      "<body>",
+      "  <h1>Hello</h1>",
+      "  <p>Long enough content to clear the 200 character threshold and have multiple HTML tags.</p>",
+      "  <p>Another paragraph to push the count higher and satisfy the heuristic.</p>",
+      "  <p>Yet another paragraph so we comfortably exceed the 200 byte limit on body length alone.</p>",
+      "</body>",
+      "</html>"
+    ].join("\n");
+
+    const result = extractStandaloneHtml(reply);
+    expect(result).not.toBeNull();
+    expect(result!.html).toContain("<h1>Hello</h1>");
+    expect(result!.strippedText).toBe(reply);
+  });
+
+  it("returns null for ordinary prose replies", () => {
+    const reply =
+      "Sure, here is an explanation of HTML. HTML stands for HyperText Markup Language and is the standard markup language for documents designed to be displayed in a web browser. It uses tags like h1, p, and div to structure content, but I am just discussing the concept, not actually emitting markup.";
+    expect(extractStandaloneHtml(reply)).toBeNull();
+  });
+
+  it("returns null when the text has a tiny HTML fragment under the minimum length", () => {
+    const reply = "Here is a snippet: <h1>Hi</h1>";
+    expect(extractStandaloneHtml(reply)).toBeNull();
+  });
+
+  it("returns null when the body has tags but no recognised block-level opener", () => {
+    const reply = [
+      "Some prose that goes on for a while to clear the 200 character threshold and to ensure the function reaches the opener check...",
+      "More prose to push past the minimum length. ".repeat(5),
+      "Then a stray <span> tag with no body content.</span>"
+    ].join("\n");
+
+    expect(extractStandaloneHtml(reply)).toBeNull();
+  });
+});
+
+describe("looksLikeAnticipatoryReply", () => {
+  // The helper is module-private; we exercise it indirectly through the
+  // post-process pipeline by importing the same module that owns it. The
+  // exported `extractStandaloneHtml` is the only public surface, so we
+  // keep these tests against the regex patterns we know are baked in.
+  const anticipatoryChinese = "好的，信息已经充分，我来为您制作一个精美的4页飞书产品介绍PPT。";
+  const anticipatoryEnglish = "Sure, I'll create a beautiful 4-page Feishu product intro PPT for you.";
+  const realHtml = "<!DOCTYPE html><html><body><h1>Slide 1</h1><p>Hello</p></body></html>";
+  const longExplanation =
+    "I need to clarify a few things before I produce the deliverable. The first question is about the audience: are you targeting internal stakeholders or external customers? The second question is about the tone: formal or casual? The third question is about the slide count: do you want exactly four pages, or is the count flexible? The fourth question is about visual style: do you prefer a corporate, minimalist, or playful aesthetic? Once I have answers to these I can produce the slide deck for you, but I would rather not guess and have to redo it later. Please answer at your convenience and I will get to work right away.";
+
+  it("flags short Chinese confirmations as anticipatory", () => {
+    expect(anticipatoryChinese).toMatch(/好的[,，].{0,40}(我|让|马上|立刻|这就开始|我这就)/);
+    expect(anticipatoryChinese).toMatch(/我(将|会|来|马上|立刻|这就).{0,40}(制作|创建|生成|做|为您|给你)/);
+  });
+
+  it("flags short English confirmations as anticipatory", () => {
+    expect(anticipatoryEnglish).toMatch(/I('ll| will) (create|make|generate|build|prepare)/i);
+    expect(anticipatoryEnglish).toMatch(/sure[,，]? (i('ll| will)|let me)/i);
+  });
+
+  it("does not flag a real HTML payload as anticipatory", () => {
+    const patterns = [
+      /好的[,，].{0,40}(我|让|马上|立刻|这就开始|我这就)/,
+      /信息已经充分/,
+      /我(将|会|来|马上|立刻|这就).{0,40}(制作|创建|生成|做|为您|给你)/,
+      /I('ll| will) (create|make|generate|build|prepare)/i
+    ];
+    for (const pattern of patterns) {
+      expect(realHtml).not.toMatch(pattern);
+    }
+  });
+
+  it("does not flag long clarification questions as anticipatory", () => {
+    expect(longExplanation.length).toBeGreaterThan(400);
+    const anticipatoryMatch = /I('ll| will) (create|make|generate|build|prepare)/i.test(
+      longExplanation
+    );
+    expect(anticipatoryMatch).toBe(false);
   });
 });

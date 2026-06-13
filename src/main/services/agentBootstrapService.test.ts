@@ -9,6 +9,10 @@ import {
   getAgentContacts,
   getNonDeletedMainAgents
 } from "../db/repositories/agentRepo";
+import {
+  createAgentRun,
+  getAgentRunById
+} from "../db/repositories/agentRunRepo";
 import { createMember, getMembersByConversation } from "../db/repositories/conversationMemberRepo";
 import {
   createConversation,
@@ -32,6 +36,7 @@ import {
   DEFAULT_MAIN_AGENT_NAME,
   ensureDefaultMainAgent
 } from "./agentBootstrapService";
+import { recoverStaleRunningAgentState } from "./staleRunRecoveryService";
 
 let tempDir: string | null = null;
 
@@ -230,5 +235,70 @@ describe("ensureDefaultMainAgent", () => {
     expect(tree.find((entry) => entry.workspace.id === legacyWorkspace.id)?.workspace.mainAgentId)
       .toBe(mainAgent.id);
     expect(getNonDeletedMainAgents(db).map((agent) => agent.id)).toEqual([mainAgent.id]);
+  });
+
+  it("recovers stale running sub-agent runs without an active conversation lock", async () => {
+    const db = initializeTempDatabase();
+    const workspace = createWorkspace(
+      {
+        name: "Workspace",
+        rootPath: path.join(tempDir!, "workspace"),
+        gitEnabled: false
+      },
+      db
+    );
+    const agent = createAgent(
+      {
+        workspaceId: workspace.id,
+        name: "前端",
+        role: "sub",
+        type: "specialist",
+        runtimeProvider: "mock",
+        status: "running"
+      },
+      db
+    );
+    const conversation = createConversation(
+      {
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        title: "Default Chat",
+        mode: "single"
+      },
+      db
+    );
+    const run = createAgentRun(
+      {
+        conversationId: conversation.id,
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        provider: "mock",
+        rootPath: workspace.rootPath,
+        systemPromptSnapshot: "",
+        toolPermissionsSnapshot: "mock"
+      },
+      db
+    );
+    db.prepare("UPDATE agent_runs SET started_at = ? WHERE id = ?").run(
+      "2026-06-10T00:00:00.000Z",
+      run.id
+    );
+
+    const result = recoverStaleRunningAgentState(db, {
+      now: new Date("2026-06-12T00:00:00.000Z"),
+      staleAfterMs: 60_000
+    });
+
+    expect(result).toMatchObject({
+      recoveredAgentRuns: 1,
+      recoveredAgents: 1
+    });
+    expect(getAgentRunById(run.id, db)).toMatchObject({
+      status: "failed",
+      errorMessage: "Recovered stale running Agent run."
+    });
+    expect(getAgentById(agent.id, db)).toMatchObject({
+      status: "error"
+    });
   });
 });

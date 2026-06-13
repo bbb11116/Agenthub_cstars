@@ -45,6 +45,7 @@ import {
   normalizeAgentSkillIds,
   validateAgentSkillIds
 } from "./agentSkillCatalogService";
+import { recoverStaleRunningAgentState } from "./staleRunRecoveryService";
 
 export type MainAgentCreationResult = {
   agent: Agent;
@@ -341,10 +342,12 @@ export function listAgentsByWorkspace(
   workspaceId: string,
   db: AgentHubDatabase = getDatabase()
 ): Agent[] {
+  recoverStaleRunningAgentState(db);
   return getAgentsByWorkspace(workspaceId, db);
 }
 
 export function listAgentContacts(db: AgentHubDatabase = getDatabase()): Agent[] {
+  recoverStaleRunningAgentState(db);
   return getAgentContacts(db);
 }
 

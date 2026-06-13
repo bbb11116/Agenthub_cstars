@@ -31,6 +31,7 @@ import { getDatabase, type AgentHubDatabase } from "../db";
 import { getAgentById, updateAgentStatus as updateAgentStatusInRepo } from "../db/repositories/agentRepo";
 import { getConversationById, createConversation } from "../db/repositories/conversationRepo";
 import { getWorkspaceById } from "../db/repositories/workspaceRepo";
+import { getMessagesByConversation, getMessageById, updateMessageContent } from "../db/repositories/messageRepo";
 import {
   createProviderSession,
   getActiveProviderSession,
@@ -59,6 +60,7 @@ import { resolveExecutionWorkspaceForConversation } from "./workspaceContextReso
 import { buildDirectAgentMemoryContext } from "./memoryContextService";
 import { createMessage } from "./messageService";
 import { createDiffProposalFromText } from "./diffProposalTextService";
+import { createDiffProposal } from "./diffService";
 import { UNIFIED_RUN_POLICY } from "../../shared/agentRunPolicy";
 import {
   runStreamingAgent,
@@ -78,23 +80,28 @@ export type RunWithConversationStreamSink = (event: RunAgentStreamEvent) => void
 const DIRECT_EDIT_POLICY = [
   "AgentHub workspace editing policy:",
   "Language policy: follow the user's latest message language. If the user writes in Chinese, answer in Chinese unless they explicitly request another language.",
-  "For explicit code or file modification requests only, produce a valid DiffProposal through AgentHub.",
+  "Execution rule: when the user gives you a deliverable request in their latest message, produce the full deliverable in THIS turn. Do NOT respond with anticipatory acknowledgments like '好的，我来为您制作' / 'Got it, I will create...' followed by stopping. The user expects the artifact, not a promise of one.",
+  "If a clarification is genuinely required, ask at most one short question AND emit a best-effort placeholder deliverable in the same turn. Never produce zero artifacts when the user clearly asked for one.",
+  "When the user asks you to create, modify, or write any file (HTML, code, config, markdown, etc.), emit a SEARCH/REPLACE block as plain text inside your reply. SEARCH/REPLACE is TEXT in your message, NOT a tool call. The user reviews the diff in the AgentHub UI and clicks Apply to commit it to the workspace.",
+  "When the user asks for a 'preview', 'draft', 'demo', 'slide deck', or any 'show me what it would look like' HTML deliverable, treat it as a file write request: emit a SEARCH/REPLACE block for the target .html file inside the workspace. AgentHub will auto-render an HTML preview card from the new file content the moment you emit the SEARCH/REPLACE — the user sees the preview without clicking Apply. Apply is only needed if the user wants the file persisted to disk. Do NOT paste the full HTML body as plain text in your reply — always emit it as a SEARCH/REPLACE block so the preview card is generated.",
+  "Slide-deck HTML format: when the deliverable is a multi-slide deck (e.g., 4-page PPT), produce ONE single HTML document with all slides stacked vertically — do NOT add JavaScript-based navigation, onclick/onkeydown handlers, prev/next buttons, page indicators, or any interactive controls. The AgentHub renderer scales the document to the panel width and lets the user scroll the iframe vertically to view each slide. Building a 'click next' / 'keyboard arrow' / 'swipe' interaction layer is wrong: it will be silently disabled by the iframe sandbox and the user will be left with broken controls. Just lay out each slide as a <section> (or <div> with a clear top margin) and the natural page-by-page scroll will work.",
+  "Do not mention keyboard shortcuts, mouse-click regions, swipe gestures, or built-in navigation controls in your reply text. The user navigates by scrolling the preview.",
+  "After emitting a SEARCH/REPLACE block, end your reply with a one-line note: 'Preview is shown above. Click Apply in the diff card if you want the file saved to disk.' (or the Chinese equivalent). This is required so the user knows the preview came from the diff.",
   "For ordinary chat, identity questions, architecture discussion, code explanation, and design advice, answer naturally as plain text.",
-  "Do not emit DiffProposal or 'No file changes proposed' blocks unless you are responding to an explicit modification request.",
-  "Do not bypass AgentHub apply_diff by writing final file changes directly.",
+  "Do not append a 'No file changes proposed' tail to ordinary Q&A answers.",
   "Do not read or write files outside workspace.rootPath."
 ].join("\n");
 const GROUP_SUBAGENT_POLICY = [
   "AgentHub group sub-agent policy:",
   "Language policy: follow the user's latest message language. If the user writes in Chinese, make summaries and reports Chinese unless explicitly requested otherwise.",
   "You only handle the assigned acceptance criteria.",
-  "Do not edit workspace files directly.",
-  "For assigned code or file modification criteria, produce a valid DiffProposal through AgentHub apply_diff review flow.",
-  "For analysis, explanation, review, or report criteria, do not emit a DiffProposal block.",
+  "For assigned code or file modification criteria, emit a SEARCH/REPLACE block as plain text in your reply. The user reviews and applies via the AgentHub UI. SEARCH/REPLACE is TEXT, not a tool call.",
+  "For analysis, explanation, review, or report criteria, do not emit a SEARCH/REPLACE block.",
   "Return one SubAgentResult JSON object as your final message."
 ].join("\n");
 function formatToolPermissions(agent: Agent): string {
   return Object.entries({ ...agent.tools, applyDiff: false })
+    .filter(([tool]) => tool !== "applyDiff")
     .map(([tool, enabled]) => `${tool}=${enabled ? "true" : "false"}`)
     .join(", ");
 }
@@ -339,6 +346,9 @@ export async function runAgentWithConversation(
     }
     if (found.workspaceId !== workspace.id) {
       throw new Error("Conversation does not belong to the workspace.");
+    }
+    if (found.type === "direct" && found.agentId !== agent.id) {
+      throw new Error("Conversation does not belong to the agent.");
     }
     if (found.provider && found.provider !== provider) {
       throw new ProviderMismatchError(found.provider, provider);
@@ -1017,6 +1027,9 @@ export async function runAgentWithConversationUnified(
     if (found.workspaceId !== workspace.id) {
       throw new Error("Conversation does not belong to the workspace.");
     }
+    if (found.type === "direct" && found.agentId !== agent.id) {
+      throw new Error("Conversation does not belong to the agent.");
+    }
     if (found.provider && found.provider !== provider) {
       throw new ProviderMismatchError(found.provider, provider);
     }
@@ -1148,6 +1161,33 @@ export async function runAgentWithConversationUnified(
     }
   }
 
+  // The `message.started` event from the unified provider adapter carries
+  // a random UUID, NOT the id of the assistant message that the streaming
+  // service actually created in the DB. The DB row is the source of
+  // truth — always look it up. See `findLatestAgentMessageId`.
+  const resolvedAssistantMessageId = findLatestAgentMessageId(conversation.id, db);
+  console.info("[AgentHub] runAgentWithConversationUnified: post-processing", {
+    conversationId: conversation.id,
+    resolvedAssistantMessageId,
+    runId,
+    status
+  });
+  if (resolvedAssistantMessageId) {
+    try {
+      await postProcessStreamingAssistantMessage({
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        conversationId: conversation.id,
+        messageId: resolvedAssistantMessageId,
+        silent: input.silent ?? false,
+        dispatchStepId: input.dispatchStepId,
+        db
+      });
+    } catch (error) {
+      console.error("[AgentHub] runAgentWithConversationUnified: postProcess threw", error);
+    }
+  }
+
   return {
     conversationId: conversation.id,
     runId: runId || "",
@@ -1156,6 +1196,223 @@ export async function runAgentWithConversationUnified(
     ...(errorMessage ? { errorMessage } : {}),
     agentId: agent.id
   };
+}
+
+function findLatestAgentMessageId(
+  conversationId: string,
+  db: AgentHubDatabase
+): string | null {
+  const row = db
+    .prepare(
+      `SELECT id FROM messages
+       WHERE conversation_id = ? AND sender_type = 'agent' AND message_type = 'text'
+       ORDER BY created_at DESC, id DESC
+       LIMIT 1`
+    )
+    .get(conversationId) as { id: string } | undefined;
+  return row?.id ?? null;
+}
+
+async function postProcessStreamingAssistantMessage(input: {
+  workspaceId: string;
+  agentId: string;
+  conversationId: string;
+  messageId: string;
+  silent: boolean;
+  dispatchStepId: string | undefined;
+  db: AgentHubDatabase;
+}): Promise<void> {
+  if (input.silent) return;
+  const message = getMessageById(input.messageId, input.db);
+  if (!message) {
+    console.info("[AgentHub] postProcess: no message found", { messageId: input.messageId });
+    return;
+  }
+  const content = message.content;
+  if (!content || typeof content !== "object" || !("text" in content)) {
+    console.info("[AgentHub] postProcess: message has no text content", { messageId: input.messageId });
+    return;
+  }
+  const rawText = (content as { text?: unknown }).text;
+  if (typeof rawText !== "string" || rawText.trim().length === 0) {
+    console.info("[AgentHub] postProcess: text empty", { messageId: input.messageId });
+    return;
+  }
+
+  console.info("[AgentHub] postProcess: starting", {
+    conversationId: input.conversationId,
+    messageId: input.messageId,
+    textLength: rawText.length
+  });
+
+  let processed: Awaited<ReturnType<typeof createDiffProposalFromText>>;
+  try {
+    processed = await createDiffProposalFromText(
+      {
+        workspaceId: input.workspaceId,
+        agentId: input.agentId,
+        conversationId: input.conversationId,
+        text: rawText,
+        dispatchStepId: input.dispatchStepId
+      },
+      input.db
+    );
+  } catch (error) {
+    console.warn("[AgentHub] postProcess: createDiffProposalFromText threw", error);
+    return;
+  }
+
+  console.info("[AgentHub] postProcess: parsed", {
+    conversationId: input.conversationId,
+    proposalsCount: processed.diffProposals.length
+  });
+
+  // Strip the SEARCH/REPLACE blocks from the visible message body so the
+  // user sees prose + diff cards / preview cards, not raw edit blocks.
+  if (processed.text !== rawText) {
+    updateMessageContent(input.messageId, { text: processed.text }, input.db);
+  }
+
+  // Each HTML DiffProposal already has its own diff_card message with the
+  // preview attached (created by createDiffProposal inside
+  // createDiffProposalFromText). Nothing more to do here for that path.
+
+  // Fallback: if no DiffProposal produced an HTML preview above, scan the
+  // assistant text for raw HTML (LLMs often ignore the SEARCH/REPLACE
+  // policy and just dump the HTML body inline). If we find a substantial
+  // HTML document, render it as a preview so the user still sees the
+  // output. Skip when the text clearly looks like SEARCH/REPLACE output
+  // (handled above) or when the LLM is just discussing HTML in prose.
+  if (processed.diffProposals.length > 0) return;
+  const extraction = extractStandaloneHtml(rawText);
+  if (!extraction) {
+    console.info("[AgentHub] postProcess: HTML fallback skipped", {
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      textLength: rawText.length,
+      hasHtml: /<[a-zA-Z]/.test(rawText),
+      hasFence: /```/.test(rawText),
+      hasDoctype: /<!doctype/i.test(rawText)
+    });
+    return;
+  }
+  const { html: fallbackHtml, strippedText } = extraction;
+  // Route the inline HTML through the same diff_card flow as a real
+  // SEARCH/REPLACE block: build a DiffProposal (new file) so the user
+  // gets an Apply button identical to the main agent's path. createDiffProposal
+  // also creates the diff_card message and attaches the rendered preview to it.
+  const fallbackFilePath = "preview.html";
+  try {
+    const proposal = await createDiffProposal(
+      {
+        workspaceId: input.workspaceId,
+        agentId: input.agentId,
+        conversationId: input.conversationId,
+        filePath: fallbackFilePath,
+        newContent: fallbackHtml,
+        isNewFile: true
+      },
+      input.db
+    );
+    if (strippedText && strippedText !== rawText) {
+      updateMessageContent(
+        input.messageId,
+        { text: strippedText },
+        input.db
+      );
+    }
+    console.info("[AgentHub] postProcess: attached inline-HTML fallback diff_card", {
+      conversationId: input.conversationId,
+      messageId: input.messageId,
+      proposalId: proposal.id,
+      filePath: proposal.filePath,
+      htmlLength: fallbackHtml.length,
+      stripped: strippedText !== rawText
+    });
+  } catch (error) {
+    console.warn(
+      "Failed to auto-create fallback HTML DiffProposal:",
+      error
+    );
+  }
+
+  // No DiffProposal, no inline-HTML fallback. If the reply looks like an
+  // anticipatory acknowledgment ("I will make it" / "好的我来制作")
+  // followed by silence, surface a warning so the user knows the LLM did
+  // not actually deliver. The user can then re-prompt explicitly.
+  if (looksLikeAnticipatoryReply(rawText)) {
+    console.warn(
+      "[AgentHub] postProcess: LLM produced an anticipatory acknowledgment without delivering. Reply was:",
+      rawText.slice(0, 200)
+    );
+  }
+}
+
+/**
+ * Heuristic for "LLM said it would deliver but did not actually produce
+ * the deliverable". Matches short Chinese and English phrases that are
+ * commonly used as polite confirmations before a (missing) artifact.
+ */
+function looksLikeAnticipatoryReply(text: string): boolean {
+  if (text.length > 400) return false;
+  const patterns = [
+    /好的[,，].{0,40}(我|让|马上|立刻|这就开始|我这就)/,
+    /信息已经充分/,
+    /我(将|会|来|马上|立刻|这就).{0,40}(制作|创建|生成|做|为您|给你)/,
+    /I('ll| will) (create|make|generate|build|prepare)/i,
+    /let me (create|make|generate|build|prepare)/i,
+    /sure[,，]? (i('ll| will)|let me)/i
+  ];
+  return patterns.some((pattern) => pattern.test(text));
+}
+
+const HTML_FALLBACK_MIN_LENGTH = 100;
+const HTML_FALLBACK_MIN_TAGS = 2;
+const HTML_FALLBACK_REQUIRED_OPEN = /<(html|body|head|section|article|main|div|h1|h2|h3|h4|p|table|ul|ol|li|header|footer|nav|figure)\b/i;
+const HTML_FALLBACK_TAG_COUNT = /<\/?[a-zA-Z][a-zA-Z0-9-]*\b[^>]*>/g;
+
+/**
+ * Detects a substantial standalone HTML document inside the LLM's reply.
+ * Returns the HTML body to render and the stripped message text, or null
+ * if the text does not look like a real HTML deliverable. Strips
+ * surrounding markdown fences if any.
+ */
+export function extractStandaloneHtml(
+  text: string
+): { html: string; strippedText: string } | null {
+  if (text.length < HTML_FALLBACK_MIN_LENGTH) return null;
+  if (!HTML_FALLBACK_REQUIRED_OPEN.test(text)) return null;
+  const tagMatches = text.match(HTML_FALLBACK_TAG_COUNT);
+  if (!tagMatches || tagMatches.length < HTML_FALLBACK_MIN_TAGS) return null;
+
+  // If wrapped in a fenced code block, extract the body of the first
+  // matching fence and strip the fence from the message text. Accept
+  // backtick or tilde fences, optional language tag, with or without
+  // a trailing newline before the closing fence.
+  const fencePatterns = [
+    /```[a-zA-Z0-9_+-]*\n([\s\S]*?)\n```/,
+    /~~~[a-zA-Z0-9_+-]*\n([\s\S]*?)\n~~~/
+  ];
+  for (const pattern of fencePatterns) {
+    const fenceMatch = text.match(pattern);
+    if (!fenceMatch) continue;
+    const body = fenceMatch[1];
+    if (
+      body.length >= HTML_FALLBACK_MIN_LENGTH &&
+      HTML_FALLBACK_REQUIRED_OPEN.test(body) &&
+      (body.match(HTML_FALLBACK_TAG_COUNT) ?? []).length >= HTML_FALLBACK_MIN_TAGS
+    ) {
+      const strippedText = (text.slice(0, fenceMatch.index ?? 0) +
+        text.slice(
+          (fenceMatch.index ?? 0) + fenceMatch[0].length,
+          text.length
+        ))
+        .replace(/\n{3,}/g, "\n\n")
+        .trim();
+      return { html: body, strippedText: strippedText || "" };
+    }
+  }
+  return { html: text, strippedText: text };
 }
 
 export type { AgentRunEvent };

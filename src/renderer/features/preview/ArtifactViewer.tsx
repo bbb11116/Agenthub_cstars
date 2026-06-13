@@ -2,6 +2,7 @@ import { useState } from "react";
 import type { Artifact } from "../../../shared/artifact";
 import { HtmlPreview } from "./HtmlPreview";
 import { MarkdownPreview } from "./MarkdownPreview";
+import { ScaledHtmlFrame } from "./ScaledHtmlFrame";
 import { ScaledPdfFrame } from "./ScaledPdfFrame";
 import { ZoomablePreview } from "./ZoomablePreview";
 
@@ -169,7 +170,11 @@ export function ArtifactViewer({
         <ZoomablePreview className={compact ? "compact" : ""}>
           <div className={compact ? "preview-body compact" : "preview-body"}>
             {artifact.type === "html" ? (
-              <HtmlPreview content={content} title={artifact.title} />
+              artifact.filePath && compact ? (
+                <ScaledHtmlFrame content={content} title={artifact.title} />
+              ) : (
+                <HtmlPreview content={content} title={artifact.title} />
+              )
             ) : artifact.type === "markdown" ? (
               <MarkdownPreview content={visibleContent} />
             ) : (

@@ -11,6 +11,11 @@ import type { MessageArtifactType } from "../../shared/agentRunEvent";
 import { getDatabase, type AgentHubDatabase } from "../db";
 import { createMessage } from "./messageService";
 import { createDiffProposal } from "./diffService";
+import {
+  attachArtifactPreviewToMessage,
+  createArtifact,
+  inferPreviewArtifactType
+} from "./artifactService";
 import { createAgentRun as createAgentRunRecord, updateAgentRunStatus, updateAgentRunProviderSessionId, markAgentRunUsedFallback, getAgentRunById } from "../db/repositories/agentRunRepo";
 import { insertAgentRunEvent, generateAgentRunEventId } from "../db/repositories/agentRunEventRepo";
 import { appendMessageMarkdown, appendMessageThinking, updateMessageStatus } from "../db/repositories/messageRepo";
@@ -24,6 +29,22 @@ import { buildConversationContextForAgentRun, DEFAULT_CONTEXT_SAFETY_MARGIN_TOKE
 import { loadMainAgentConfig } from "./configService";
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS } from "../../shared/modelProvider";
 import { ThinkBlockParser } from "./thinkBlockParser";
+
+const HTML_FILE_PATTERN = /\.(html?|htm)$/i;
+
+function extractAddedFileContent(unifiedDiff: string): string {
+  const lines = unifiedDiff.split(/\r?\n/);
+  const content: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("+")) {
+      content.push(line.slice(1));
+    } else if (line.startsWith(" ")) {
+      content.push(line.slice(1));
+    }
+  }
+  return content.join("\n");
+}
 
 export type StreamingRunSink = (event: AgentRunEvent) => void;
 
@@ -262,10 +283,45 @@ export async function* runStreamingAgent(
                   agentId: input.agent.id,
                   conversationId: input.conversationId,
                   filePath: file.path,
-                  unifiedDiff: file.unifiedDiff
+                  unifiedDiff: file.unifiedDiff,
+                  isNewFile: file.status === "added"
                 },
                 db
               );
+              // Auto-create an HTML preview from added HTML files so the
+              // user can see the rendered preview immediately, without
+              // having to click Apply. Modified/deleted files require the
+              // original on disk to reconstruct newContent, so they are
+              // skipped here.
+              if (file.status === "added" && HTML_FILE_PATTERN.test(file.path)) {
+                const newContent = extractAddedFileContent(file.unifiedDiff);
+                if (newContent.length > 0) {
+                  const previewType = inferPreviewArtifactType(undefined, file.path);
+                  if (previewType) {
+                    const previewArtifact = createArtifact(
+                      {
+                        workspaceId: input.workspaceId,
+                        agentId: input.agent.id,
+                        conversationId: input.conversationId,
+                        type: previewType,
+                        title: file.path,
+                        content: newContent,
+                        language: previewType,
+                        filePath: file.path
+                      },
+                      db
+                    );
+                    attachArtifactPreviewToMessage(
+                      {
+                        messageId: assistantMessage.id,
+                        conversationId: input.conversationId,
+                        artifact: previewArtifact
+                      },
+                      db
+                    );
+                  }
+                }
+              }
             } catch (error) {
               console.warn(
                 `Failed to create diff proposal for ${file.path}:`,

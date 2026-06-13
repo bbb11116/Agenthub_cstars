@@ -1,4 +1,11 @@
-import { useEffect, useMemo, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useState,
+  type CSSProperties,
+  type KeyboardEvent as ReactKeyboardEvent,
+  type PointerEvent as ReactPointerEvent
+} from "react";
 import type { Artifact } from "../shared/artifact";
 import { ArtifactsTab } from "./features/artifacts/ArtifactsTab";
 import { ChatWindow } from "./features/chat/ChatWindow";
@@ -28,6 +35,13 @@ type ApiState =
 const inspectorTabs = ["Files", "Artifacts", "Preview", "Diff", "Git", "Runtime"] as const;
 type InspectorTab = (typeof inspectorTabs)[number];
 
+const INSPECTOR_DEFAULT_WIDTH = 520;
+const INSPECTOR_MIN_WIDTH = 360;
+const INSPECTOR_MAX_WIDTH = 920;
+const INSPECTOR_MIN_CHAT_WIDTH = 380;
+const INSPECTOR_RESIZE_STEP = 16;
+const INSPECTOR_RESIZE_LARGE_STEP = 40;
+
 const inspectorTabIcons: Record<InspectorTab, AppIconName> = {
   Files: "files",
   Artifacts: "artifacts",
@@ -36,6 +50,23 @@ const inspectorTabIcons: Record<InspectorTab, AppIconName> = {
   Git: "git",
   Runtime: "runtime"
 };
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(Math.max(value, min), max);
+}
+
+function getInspectorMaxWidth(listPaneCollapsed: boolean): number {
+  if (typeof window === "undefined") {
+    return INSPECTOR_MAX_WIDTH;
+  }
+
+  const sidebarWidth = listPaneCollapsed ? 72 : 72 + 320;
+  const shellPaddingAndGaps = 72;
+  const available =
+    window.innerWidth - sidebarWidth - INSPECTOR_MIN_CHAT_WIDTH - shellPaddingAndGaps;
+
+  return Math.max(INSPECTOR_MIN_WIDTH, Math.min(INSPECTOR_MAX_WIDTH, Math.floor(available)));
+}
 
 function App() {
   const {
@@ -74,10 +105,20 @@ function App() {
   const [settingsDrawerAgentId, setSettingsDrawerAgentId] = useState<string | undefined>();
   const [historyModalOpen, setHistoryModalOpen] = useState(false);
   const [listPaneCollapsed, setListPaneCollapsed] = useState(false);
+  const [inspectorWidth, setInspectorWidth] = useState(INSPECTOR_DEFAULT_WIDTH);
   const [artifactOverlay, setArtifactOverlay] = useState<{
     artifactId: string;
     mode: ArtifactOverlayMode;
   } | null>(null);
+
+  const shellClassName = [
+    "app-shell",
+    listPaneCollapsed ? "list-pane-collapsed" : "",
+    inspectorOpen ? "inspector-open" : ""
+  ].filter(Boolean).join(" ");
+  const shellStyle = {
+    "--ah-inspector-width": `${inspectorWidth}px`
+  } as CSSProperties;
 
   useEffect(() => {
     let cancelled = false;
@@ -146,6 +187,29 @@ function App() {
       setSettingsDrawerOpen(false);
     }
   }, [isSkillsView]);
+
+  useEffect(() => {
+    if (!inspectorOpen) {
+      return;
+    }
+
+    setInspectorWidth((width) =>
+      clamp(width, INSPECTOR_MIN_WIDTH, getInspectorMaxWidth(listPaneCollapsed))
+    );
+  }, [inspectorOpen, listPaneCollapsed]);
+
+  useEffect(() => {
+    function handleResize(): void {
+      setInspectorWidth((width) =>
+        clamp(width, INSPECTOR_MIN_WIDTH, getInspectorMaxWidth(listPaneCollapsed))
+      );
+    }
+
+    window.addEventListener("resize", handleResize);
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [listPaneCollapsed]);
 
   useEffect(() => {
     function handleKeyDown(event: KeyboardEvent): void {
@@ -273,6 +337,56 @@ function App() {
     setInspectorOpen(true);
   }
 
+  function resizeInspector(nextWidth: number): void {
+    setInspectorWidth(
+      clamp(nextWidth, INSPECTOR_MIN_WIDTH, getInspectorMaxWidth(listPaneCollapsed))
+    );
+  }
+
+  function handleInspectorResizePointerDown(
+    event: ReactPointerEvent<HTMLDivElement>
+  ): void {
+    event.preventDefault();
+    event.currentTarget.setPointerCapture(event.pointerId);
+
+    const startX = event.clientX;
+    const startWidth = inspectorWidth;
+    document.body.classList.add("inspector-resizing");
+
+    function handlePointerMove(moveEvent: PointerEvent): void {
+      resizeInspector(startWidth + startX - moveEvent.clientX);
+    }
+
+    function handlePointerUp(): void {
+      document.body.classList.remove("inspector-resizing");
+      window.removeEventListener("pointermove", handlePointerMove);
+      window.removeEventListener("pointerup", handlePointerUp);
+      window.removeEventListener("pointercancel", handlePointerUp);
+    }
+
+    window.addEventListener("pointermove", handlePointerMove);
+    window.addEventListener("pointerup", handlePointerUp);
+    window.addEventListener("pointercancel", handlePointerUp);
+  }
+
+  function handleInspectorResizeKeyDown(event: ReactKeyboardEvent<HTMLDivElement>): void {
+    const step = event.shiftKey ? INSPECTOR_RESIZE_LARGE_STEP : INSPECTOR_RESIZE_STEP;
+
+    if (event.key === "ArrowLeft") {
+      event.preventDefault();
+      resizeInspector(inspectorWidth + step);
+    } else if (event.key === "ArrowRight") {
+      event.preventDefault();
+      resizeInspector(inspectorWidth - step);
+    } else if (event.key === "Home") {
+      event.preventDefault();
+      resizeInspector(INSPECTOR_MIN_WIDTH);
+    } else if (event.key === "End") {
+      event.preventDefault();
+      resizeInspector(getInspectorMaxWidth(listPaneCollapsed));
+    }
+  }
+
   if (appView === "loading" || !workspaceInitialized) {
     return (
       <main className="workspace-landing-shell">
@@ -297,7 +411,7 @@ function App() {
   }
 
   return (
-    <main className={listPaneCollapsed ? "app-shell list-pane-collapsed" : "app-shell"}>
+    <main className={shellClassName} style={shellStyle}>
       <Sidebar
         listPaneCollapsed={listPaneCollapsed}
         onListPaneChange={setListPaneCollapsed}
@@ -425,72 +539,76 @@ function App() {
       </section>
 
       {inspectorOpen ? (
-        <button
-          className="inspector-scrim"
-          type="button"
-          aria-label="关闭 Inspector"
-          onClick={() => setInspectorOpen(false)}
-        />
-      ) : null}
-
-      <aside
-        className={inspectorOpen ? "inspector inspector-drawer open" : "inspector inspector-drawer"}
-        aria-label="Inspector panel"
-        aria-hidden={!inspectorOpen}
-      >
-        <div className="panel-header inspector-drawer-header">
-          <div>
-            <span className="eyebrow">Inspector</span>
-            <h2>{activeTab}</h2>
-          </div>
-          <button
-            className="inspector-close-button"
-            type="button"
-            aria-label="关闭 Inspector"
-            onClick={() => setInspectorOpen(false)}
-          >
-            <AppIcon name="close" />
-          </button>
-        </div>
-
-        <div className="inspector-tabs" role="tablist" aria-label="Inspector tabs">
-          {inspectorTabs.map((tab) => (
+        <aside
+          className="inspector inspector-drawer open"
+          aria-label="Inspector panel"
+        >
+          <div
+            className="inspector-resize-handle"
+            role="separator"
+            tabIndex={0}
+            aria-label="调整 Inspector 宽度"
+            aria-orientation="vertical"
+            aria-valuemin={INSPECTOR_MIN_WIDTH}
+            aria-valuemax={getInspectorMaxWidth(listPaneCollapsed)}
+            aria-valuenow={inspectorWidth}
+            onPointerDown={handleInspectorResizePointerDown}
+            onKeyDown={handleInspectorResizeKeyDown}
+          />
+          <div className="panel-header inspector-drawer-header">
+            <div>
+              <span className="eyebrow">Inspector</span>
+              <h2>{activeTab}</h2>
+            </div>
             <button
-              key={tab}
-              className={tab === activeTab ? "active" : ""}
+              className="inspector-close-button"
               type="button"
-              role="tab"
-              aria-label={`${tab} Inspector`}
-              aria-selected={tab === activeTab}
-              onClick={() => setActiveTab(tab)}
+              aria-label="关闭 Inspector"
+              onClick={() => setInspectorOpen(false)}
             >
-              {tab}
+              <AppIcon name="close" />
             </button>
-          ))}
-        </div>
+          </div>
 
-        <div className="inspector-content">
-          {activeTab === "Files" ? (
-            <FilesTab />
-          ) : activeTab === "Artifacts" ? (
-            <ArtifactsTab
-              activeArtifactId={activeArtifactId}
-              onOpenArtifact={handleOpenArtifact}
-            />
-          ) : activeTab === "Preview" ? (
-            <PreviewTab
-              artifactId={activeArtifactId}
-              onOpenDiff={() => setActiveTab("Diff")}
-            />
-          ) : activeTab === "Diff" ? (
-            <DiffTab />
-          ) : activeTab === "Runtime" ? (
-            <RuntimeSettings />
-          ) : activeTab === "Git" ? (
-            <GitTab />
-          ) : null}
-        </div>
-      </aside>
+          <div className="inspector-tabs" role="tablist" aria-label="Inspector tabs">
+            {inspectorTabs.map((tab) => (
+              <button
+                key={tab}
+                className={tab === activeTab ? "active" : ""}
+                type="button"
+                role="tab"
+                aria-label={`${tab} Inspector`}
+                aria-selected={tab === activeTab}
+                onClick={() => setActiveTab(tab)}
+              >
+                {tab}
+              </button>
+            ))}
+          </div>
+
+          <div className="inspector-content">
+            {activeTab === "Files" ? (
+              <FilesTab />
+            ) : activeTab === "Artifacts" ? (
+              <ArtifactsTab
+                activeArtifactId={activeArtifactId}
+                onOpenArtifact={handleOpenArtifact}
+              />
+            ) : activeTab === "Preview" ? (
+              <PreviewTab
+                artifactId={activeArtifactId}
+                onOpenDiff={() => setActiveTab("Diff")}
+              />
+            ) : activeTab === "Diff" ? (
+              <DiffTab />
+            ) : activeTab === "Runtime" ? (
+              <RuntimeSettings />
+            ) : activeTab === "Git" ? (
+              <GitTab />
+            ) : null}
+          </div>
+        </aside>
+      ) : null}
 
       {artifactOverlay ? (
         <ArtifactOverlay

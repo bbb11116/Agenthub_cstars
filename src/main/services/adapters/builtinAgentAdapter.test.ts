@@ -443,7 +443,7 @@ describe("BuiltinAgentAdapter", () => {
       userMessage: "给我做一个 PPT 大纲",
       toolPermissions: ["previewArtifact=true"],
       runOptions: {
-        mode: "single_chat",
+        mode: "group_subagent",
         maxIterations: 6,
         conversationId: "conversation-1",
         agentId: "agent-1",
@@ -616,6 +616,53 @@ describe("BuiltinAgentAdapter", () => {
     expect(passedToolNames).toContain("web_search");
   });
 
+  it("does not register create_artifact when mode is single_chat (ephemeral only for group subagents)", async () => {
+    const input: AgentRunInput = {
+      workspaceId: "workspace-1",
+      conversationId: "conversation-1",
+      agentId: "agent-1",
+      provider: "builtin_openai",
+      rootPath: "/workspace",
+      systemPrompt: "You answer questions.",
+      userMessage: "hi",
+      toolPermissions: ["previewArtifact=true", "webSearch=true"],
+      runOptions: {
+        mode: "single_chat",
+        maxIterations: 6,
+        conversationId: "conversation-1",
+        agentId: "agent-1",
+        workspaceRoot: "/workspace",
+        prompt: "hi"
+      },
+      resume: { enabled: false }
+    };
+    const config = {
+      provider: "openai_chat_completions" as const,
+      baseUrl: "https://example.test",
+      apiKey: "secret",
+      model: "model",
+      supportsStreaming: true,
+      toolCalling: "supported" as const
+    };
+
+    loadMainAgentConfig.mockReturnValue(config);
+    callLLMWithToolSupport.mockResolvedValue({
+      text: "ok",
+      toolCalls: []
+    });
+
+    const events = [];
+    for await (const event of new BuiltinAgentAdapter().run(input)) {
+      events.push(event);
+    }
+
+    const passedToolNames = (callLLMWithToolSupport.mock.calls[0][3] as Array<{ name: string }>).map(
+      (tool) => tool.name
+    );
+    expect(passedToolNames).not.toContain("create_artifact");
+    expect(passedToolNames).toContain("web_search");
+  });
+
   it("rejects create_artifact with content over 1MB and does not call createArtifact", async () => {
     const input: AgentRunInput = {
       workspaceId: "workspace-1",
@@ -627,7 +674,7 @@ describe("BuiltinAgentAdapter", () => {
       userMessage: "big content",
       toolPermissions: ["previewArtifact=true"],
       runOptions: {
-        mode: "single_chat",
+        mode: "group_subagent",
         maxIterations: 6,
         conversationId: "conversation-1",
         agentId: "agent-1",
@@ -694,7 +741,7 @@ describe("BuiltinAgentAdapter", () => {
       userMessage: "bad type",
       toolPermissions: ["previewArtifact=true"],
       runOptions: {
-        mode: "single_chat",
+        mode: "group_subagent",
         maxIterations: 6,
         conversationId: "conversation-1",
         agentId: "agent-1",
@@ -761,7 +808,7 @@ describe("BuiltinAgentAdapter", () => {
       userMessage: "missing",
       toolPermissions: ["previewArtifact=true"],
       runOptions: {
-        mode: "single_chat",
+        mode: "group_subagent",
         maxIterations: 6,
         conversationId: "conversation-1",
         agentId: "agent-1",

@@ -39,4 +39,23 @@ describe("buildOrchestratorSystemPrompt", () => {
     expect(prompt).not.toContain("dispatch to specialist sub-agents");
     expect(prompt).toContain("切换 Runtime");
   });
+
+  it("constrains PPT HTML output to a full-width slide canvas", () => {
+    const workspace: Workspace = {
+      id: "workspace",
+      name: "Workspace",
+      rootPath: "/workspace",
+      mainAgentId: "main-agent",
+      gitEnabled: false,
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString()
+    };
+    const prompt = buildOrchestratorSystemPrompt(workspace, [], []);
+
+    expect(prompt).toContain("PPT / 幻灯片 / slide deck");
+    expect(prompt).toContain("width: 1920px");
+    expect(prompt).toContain("height: 1080px");
+    expect(prompt).toContain("不要使用 `max-width` 外层容器");
+    expect(prompt).toContain("不要添加 JavaScript 翻页");
+  });
 });

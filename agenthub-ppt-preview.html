@@ -1,0 +1,666 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>AgentHub 项目介绍 PPT 预览</title>
+    <style>
+      :root {
+        --bg: #0b1020;
+        --panel: #121a2c;
+        --panel-2: #172238;
+        --text: #eef4ff;
+        --muted: #aab8cf;
+        --line: rgba(255, 255, 255, 0.13);
+        --cyan: #53d7e8;
+        --green: #8bdc9a;
+        --amber: #ffc768;
+        --red: #ff8877;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--text);
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+        background:
+          radial-gradient(circle at 78% 18%, rgba(83, 215, 232, 0.14), transparent 32%),
+          linear-gradient(145deg, #070a12 0%, #111827 46%, #1c1727 100%);
+        overflow: hidden;
+      }
+
+      .deck {
+        width: 100vw;
+        height: 100vh;
+        display: grid;
+        grid-template-rows: 58px 1fr 64px;
+      }
+
+      .topbar,
+      .bottombar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        padding: 0 28px;
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .brand {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        color: var(--text);
+        font-weight: 700;
+      }
+
+      .brand-dot {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: linear-gradient(135deg, var(--cyan), var(--amber));
+        box-shadow: 0 0 22px rgba(83, 215, 232, 0.65);
+      }
+
+      .progress {
+        width: min(420px, 34vw);
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.1);
+        overflow: hidden;
+      }
+
+      .progress span {
+        display: block;
+        height: 100%;
+        width: 20%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, var(--cyan), var(--green), var(--amber));
+        transition: width 180ms ease;
+      }
+
+      .stage {
+        display: grid;
+        place-items: center;
+        padding: 18px 40px;
+      }
+
+      .slide {
+        display: none;
+        position: relative;
+        width: min(1180px, calc(100vw - 80px));
+        aspect-ratio: 16 / 9;
+        max-height: calc(100vh - 150px);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.045), rgba(255, 255, 255, 0.015)),
+          var(--panel);
+        box-shadow: 0 28px 90px rgba(0, 0, 0, 0.42);
+        overflow: hidden;
+        padding: 56px;
+      }
+
+      .slide.active {
+        display: block;
+      }
+
+      .slide::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(255, 255, 255, 0.035) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(255, 255, 255, 0.035) 1px, transparent 1px);
+        background-size: 34px 34px;
+        mask-image: linear-gradient(90deg, transparent, #000 18%, #000 82%, transparent);
+      }
+
+      .slide > * {
+        position: relative;
+        z-index: 1;
+      }
+
+      .eyebrow {
+        color: var(--cyan);
+        font-size: 13px;
+        font-weight: 800;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      h1,
+      h2 {
+        margin: 0;
+        letter-spacing: 0;
+      }
+
+      h1 {
+        max-width: 670px;
+        font-size: clamp(48px, 5.8vw, 82px);
+        line-height: 0.96;
+      }
+
+      h2 {
+        font-size: clamp(32px, 3.3vw, 48px);
+        line-height: 1.08;
+      }
+
+      p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 19px;
+        line-height: 1.62;
+      }
+
+      .lead {
+        max-width: 780px;
+        margin-top: 24px;
+        color: #d7e1f2;
+        font-size: 24px;
+        line-height: 1.48;
+      }
+
+      .cover {
+        display: grid;
+        grid-template-columns: 1.05fr 0.95fr;
+        gap: 36px;
+        align-items: center;
+      }
+
+      .cover-art {
+        position: relative;
+        height: 100%;
+        min-height: 410px;
+      }
+
+      .star {
+        position: absolute;
+        right: 24px;
+        top: 12px;
+        width: min(410px, 40vw);
+        border-radius: 50%;
+        filter: drop-shadow(0 22px 55px rgba(83, 215, 232, 0.35));
+      }
+
+      .flow {
+        position: absolute;
+        left: 0;
+        right: 0;
+        bottom: 24px;
+        display: grid;
+        grid-template-columns: repeat(4, 1fr);
+        gap: 10px;
+      }
+
+      .flow-item,
+      .card,
+      .matrix-cell,
+      .value-card {
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.055);
+      }
+
+      .flow-item {
+        min-height: 74px;
+        padding: 14px;
+        font-weight: 800;
+        display: grid;
+        align-content: center;
+      }
+
+      .flow-item span {
+        display: block;
+        margin-top: 6px;
+        color: var(--muted);
+        font-size: 12px;
+        font-weight: 600;
+      }
+
+      .tech-line {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 10px;
+        margin-top: 36px;
+      }
+
+      .pill {
+        padding: 8px 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        color: #dce7f8;
+        background: rgba(255, 255, 255, 0.06);
+        font-size: 14px;
+        font-weight: 700;
+      }
+
+      .two-col {
+        display: grid;
+        grid-template-columns: 0.9fr 1.1fr;
+        gap: 34px;
+        margin-top: 34px;
+      }
+
+      .quote {
+        padding: 28px;
+        border-left: 5px solid var(--cyan);
+        background: rgba(83, 215, 232, 0.09);
+        border-radius: 0 8px 8px 0;
+      }
+
+      .quote p {
+        color: #e7f3ff;
+        font-size: 25px;
+        line-height: 1.5;
+      }
+
+      .cards {
+        display: grid;
+        grid-template-columns: repeat(2, 1fr);
+        gap: 16px;
+      }
+
+      .card {
+        padding: 22px;
+        min-height: 146px;
+      }
+
+      .card strong,
+      .matrix-cell strong,
+      .value-card strong {
+        display: block;
+        margin-bottom: 10px;
+        color: #ffffff;
+        font-size: 20px;
+      }
+
+      .card p,
+      .matrix-cell li,
+      .value-card li {
+        font-size: 16px;
+        line-height: 1.52;
+      }
+
+      .matrix {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 18px;
+        margin-top: 34px;
+      }
+
+      .matrix-cell {
+        padding: 24px;
+        min-height: 310px;
+      }
+
+      ul {
+        margin: 0;
+        padding-left: 20px;
+        color: var(--muted);
+      }
+
+      li {
+        margin: 10px 0;
+      }
+
+      .note {
+        margin-top: 24px;
+        padding: 16px 18px;
+        border: 1px solid rgba(255, 199, 104, 0.45);
+        border-radius: 8px;
+        color: #ffe0a3;
+        background: rgba(255, 199, 104, 0.08);
+        font-weight: 800;
+      }
+
+      .arch {
+        display: grid;
+        grid-template-columns: 1fr;
+        gap: 12px;
+        margin-top: 30px;
+      }
+
+      .layer {
+        display: grid;
+        grid-template-columns: 250px 1fr;
+        gap: 22px;
+        align-items: center;
+        padding: 18px 22px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.055);
+      }
+
+      .layer strong {
+        font-size: 20px;
+      }
+
+      .layer p {
+        font-size: 16px;
+      }
+
+      .bridge {
+        justify-self: center;
+        color: var(--cyan);
+        font-weight: 800;
+      }
+
+      .key-points {
+        display: grid;
+        grid-template-columns: repeat(3, 1fr);
+        gap: 12px;
+        margin-top: 22px;
+      }
+
+      .key-points div {
+        padding: 13px 14px;
+        border-radius: 8px;
+        background: rgba(139, 220, 154, 0.09);
+        color: #dff8e5;
+        font-size: 15px;
+        font-weight: 750;
+      }
+
+      .values {
+        display: grid;
+        grid-template-columns: 1fr 0.85fr;
+        gap: 30px;
+        margin-top: 30px;
+      }
+
+      .value-card {
+        padding: 24px;
+      }
+
+      .closing {
+        margin-top: 24px;
+        color: #ffffff;
+        font-size: 26px;
+        font-weight: 850;
+        line-height: 1.34;
+      }
+
+      button {
+        appearance: none;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: rgba(255, 255, 255, 0.07);
+        color: var(--text);
+        padding: 10px 14px;
+        font: inherit;
+        font-weight: 800;
+        cursor: pointer;
+      }
+
+      button:hover {
+        background: rgba(255, 255, 255, 0.12);
+      }
+
+      .controls {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+      }
+
+      @media (max-width: 900px) {
+        body {
+          overflow: auto;
+        }
+
+        .deck {
+          min-height: 100vh;
+          height: auto;
+          grid-template-rows: auto 1fr auto;
+        }
+
+        .topbar,
+        .bottombar {
+          padding: 16px;
+          gap: 14px;
+        }
+
+        .progress {
+          display: none;
+        }
+
+        .stage {
+          padding: 10px 16px;
+        }
+
+        .slide {
+          width: 100%;
+          min-height: 720px;
+          max-height: none;
+          aspect-ratio: auto;
+          padding: 30px;
+        }
+
+        .cover,
+        .two-col,
+        .values,
+        .matrix {
+          grid-template-columns: 1fr;
+        }
+
+        .cover-art {
+          min-height: 320px;
+        }
+
+        .star {
+          width: 260px;
+        }
+
+        .flow {
+          grid-template-columns: repeat(2, 1fr);
+        }
+
+        .layer,
+        .key-points {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="deck">
+      <header class="topbar">
+        <div class="brand"><span class="brand-dot"></span>AgentHub 项目介绍</div>
+        <div class="progress" aria-hidden="true"><span id="progress"></span></div>
+        <div id="counter">1 / 5</div>
+      </header>
+
+      <section class="stage" aria-live="polite">
+        <article class="slide cover active">
+          <div>
+            <div class="eyebrow">Project Overview</div>
+            <h1>AgentHub Desktop</h1>
+            <p class="lead">本地优先的多 Agent 协作桌面应用</p>
+            <div class="tech-line">
+              <span class="pill">Single-Chat</span>
+              <span class="pill">Group-Chat</span>
+              <span class="pill">Orchestrator</span>
+              <span class="pill">Workspace</span>
+            </div>
+          </div>
+          <div class="cover-art">
+            <img class="star" src="UI/Star.png" alt="AgentHub visual" />
+            <div class="flow">
+              <div class="flow-item">Workspace<span>本地项目目录</span></div>
+              <div class="flow-item">Main Agent<span>理解与调度</span></div>
+              <div class="flow-item">Sub Agents<span>分工执行</span></div>
+              <div class="flow-item">Review<span>Diff 与产物</span></div>
+            </div>
+          </div>
+        </article>
+
+        <article class="slide">
+          <div class="eyebrow">Positioning</div>
+          <h2>AgentHub 解决什么问题？</h2>
+          <div class="two-col">
+            <div class="quote">
+              <p>把本地代码目录变成 AI 协作空间，让多个 Agent 围绕同一个 Workspace 分工、执行、审查和沉淀上下文。</p>
+            </div>
+            <div class="cards">
+              <div class="card">
+                <strong>本地 Workspace</strong>
+                <p>绑定真实项目目录，文件、Git、上下文都围绕项目展开。</p>
+              </div>
+              <div class="card">
+                <strong>主 Agent 调度</strong>
+                <p>Orchestrator 理解任务、拆解步骤，并选择合适的子 Agent。</p>
+              </div>
+              <div class="card">
+                <strong>多 Agent 协作</strong>
+                <p>子 Agent 可绑定不同技能与 Runtime，承担专业任务。</p>
+              </div>
+              <div class="card">
+                <strong>用户可控落盘</strong>
+                <p>代码修改先生成 DiffProposal，确认后才真正写入文件。</p>
+              </div>
+            </div>
+          </div>
+        </article>
+
+        <article class="slide">
+          <div class="eyebrow">Capabilities</div>
+          <h2>从对话到项目级执行闭环</h2>
+          <div class="matrix">
+            <div class="matrix-cell">
+              <strong>单聊</strong>
+              <ul>
+                <li>与单个 Agent 一对一交流</li>
+                <li>支持流式输出</li>
+                <li>支持思考块折叠</li>
+                <li>工具调用与产物卡片内联展示</li>
+              </ul>
+            </div>
+            <div class="matrix-cell">
+              <strong>群聊</strong>
+              <ul>
+                <li>主 Agent 自动拆解任务</li>
+                <li>子 Agent 评分与选择</li>
+                <li>DAG 调度，并行或串行执行</li>
+                <li>执行状态实时展示</li>
+              </ul>
+            </div>
+            <div class="matrix-cell">
+              <strong>审查与产物</strong>
+              <ul>
+                <li>DiffProposal 审查</li>
+                <li>HTML / Markdown / 文档 / PPT / PDF 预览</li>
+                <li>Git 状态检测</li>
+                <li>Artifact 统一管理</li>
+              </ul>
+            </div>
+          </div>
+          <div class="note">核心原则：AI 可以提出修改，但用户决定是否落盘。</div>
+        </article>
+
+        <article class="slide">
+          <div class="eyebrow">Architecture</div>
+          <h2>三层 Electron 架构 + 统一事件协议</h2>
+          <div class="arch">
+            <div class="layer">
+              <strong>Renderer / React UI</strong>
+              <p>聊天、侧边栏、Inspector、Preview、Diff、Settings 等用户界面。</p>
+            </div>
+            <div class="bridge">contextBridge / window.agenthub.*</div>
+            <div class="layer">
+              <strong>Electron Main Process</strong>
+              <p>IPC、Services、Agent Runtime、Dispatch、File、Git、Artifact 与 Runtime Adapter。</p>
+            </div>
+            <div class="bridge">持久化与回放</div>
+            <div class="layer">
+              <strong>better-sqlite3</strong>
+              <p>Workspace、Agent、Conversation、Message、Diff、Artifact、Dispatch Run、Run Events。</p>
+            </div>
+          </div>
+          <div class="key-points">
+            <div>Renderer 不直接访问文件系统</div>
+            <div>Agent 输出统一为 AgentRunEvent</div>
+            <div>Runtime 通过 Adapter 层扩展</div>
+          </div>
+        </article>
+
+        <article class="slide">
+          <div class="eyebrow">Value</div>
+          <h2>为什么 AgentHub 有价值？</h2>
+          <div class="values">
+            <div>
+              <p class="lead">AgentHub 不是普通聊天工具，而是面向真实项目工作的本地多 Agent 工作台。它把上下文、调度、执行、审查和产物管理放在同一个应用里，降低多 Agent 协作的使用成本。</p>
+              <p class="closing">让 AI 协作进入项目上下文，而不是停留在孤立对话里。</p>
+            </div>
+            <div class="value-card">
+              <strong>适合场景</strong>
+              <ul>
+                <li>代码项目辅助开发</li>
+                <li>多角色任务拆解</li>
+                <li>文档、网页、PPT 等产物生成</li>
+                <li>本地 CLI Agent 统一管理</li>
+                <li>需要审查和可控落盘的 AI 工作流</li>
+              </ul>
+            </div>
+          </div>
+        </article>
+      </section>
+
+      <footer class="bottombar">
+        <div>使用左右箭头或按钮切换页面</div>
+        <div class="controls">
+          <button type="button" id="prev">上一页</button>
+          <button type="button" id="next">下一页</button>
+        </div>
+      </footer>
+    </main>
+
+    <script>
+      const slides = Array.from(document.querySelectorAll(".slide"));
+      const counter = document.getElementById("counter");
+      const progress = document.getElementById("progress");
+      const prev = document.getElementById("prev");
+      const next = document.getElementById("next");
+      let index = 0;
+
+      function render() {
+        slides.forEach((slide, slideIndex) => {
+          slide.classList.toggle("active", slideIndex === index);
+        });
+        counter.textContent = `${index + 1} / ${slides.length}`;
+        progress.style.width = `${((index + 1) / slides.length) * 100}%`;
+        prev.disabled = index === 0;
+        next.disabled = index === slides.length - 1;
+      }
+
+      prev.addEventListener("click", () => {
+        index = Math.max(0, index - 1);
+        render();
+      });
+
+      next.addEventListener("click", () => {
+        index = Math.min(slides.length - 1, index + 1);
+        render();
+      });
+
+      window.addEventListener("keydown", (event) => {
+        if (event.key === "ArrowLeft") {
+          index = Math.max(0, index - 1);
+          render();
+        }
+        if (event.key === "ArrowRight") {
+          index = Math.min(slides.length - 1, index + 1);
+          render();
+        }
+      });
+
+      render();
+    </script>
+  </body>
+</html>

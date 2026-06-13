@@ -8,6 +8,7 @@ import {
 import { getConversationsByAgent } from "../db/repositories/conversationRepo";
 import { getWorkspaces, updateWorkspace } from "../db/repositories/workspaceRepo";
 import { createDefaultConversationForAgent } from "./conversationService";
+import { recoverStaleRunningAgentState } from "./staleRunRecoveryService";
 
 function compareIsoAscending(left: string, right: string): number {
   return left.localeCompare(right);
@@ -64,6 +65,8 @@ function ensureAgentConversations(agent: Agent, db: AgentHubDatabase): Conversat
 }
 
 export function getNavigationTree(db: AgentHubDatabase = getDatabase()): WorkspaceTreeDTO[] {
+  recoverStaleRunningAgentState(db);
+
   const readTree = db.transaction(() => {
     return getWorkspaces(db).map((workspace) => {
       const workspaceWithMainAgent = ensureWorkspaceMainAgent(workspace, db);

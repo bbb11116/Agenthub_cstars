@@ -135,10 +135,13 @@ export function ChatWindow() {
     activeAgent,
     activeConversation,
     activeWorkspace,
+    activeWorkspaceAgents,
     agentTreeError,
     agentTreeStatus,
+    contacts,
     loadWorkspaceTree,
     messagesByConversationId,
+    selectChat,
     isSendingByConversationId,
     setConversationMessages,
     setConversationSending,
@@ -284,7 +287,18 @@ export function ChatWindow() {
 
   const handleSendText = useCallback(
     async (text: string) => {
-      if (!activeWorkspace || !activeAgent) {
+      const targetAgent =
+        activeConversation?.type === "direct"
+          ? activeWorkspaceAgents.find((agent) => agent.id === activeConversation.agentId) ??
+            contacts.find((agent) => agent.id === activeConversation.agentId) ??
+            activeAgent
+          : activeAgent;
+      const targetWorkspaceId =
+        activeConversation?.type === "direct"
+          ? activeConversation.workspaceId
+          : activeWorkspace?.id;
+
+      if (!targetWorkspaceId || !targetAgent) {
         setSendError("请先选择会话。");
         return;
       }
@@ -295,13 +309,13 @@ export function ChatWindow() {
       setSendError(null);
 
       try {
-        if (activeAgent.role === "main") {
+        if (targetAgent.role === "main") {
           // Main Agent messages use the ordinary run path. Agent creation is manual.
           const cid = conversationId ?? "";
           if (cid) {
             const content: TextMessageContent = { text };
             const input: CreateMessageInput = {
-              workspaceId: activeWorkspace.id,
+              workspaceId: targetWorkspaceId,
               conversationId: cid,
               senderType: "user",
               senderId: LOCAL_USER_ID,
@@ -319,28 +333,30 @@ export function ChatWindow() {
           }
 
           const output = await runAgentWithConversationStreaming({
-            workspaceId: activeWorkspace.id,
-            agentId: activeAgent.id,
+            workspaceId: targetWorkspaceId,
+            agentId: targetAgent.id,
             conversationId,
             message: text,
             resume: Boolean(conversationId)
           });
 
           if (!conversationId && output.conversationId) {
-            void loadWorkspaceTree(activeWorkspace.id);
+            await loadWorkspaceTree(targetWorkspaceId);
+            selectChat(output.conversationId);
+          } else {
+            void loadWorkspaceTree(targetWorkspaceId);
           }
-          void loadWorkspaceTree(activeWorkspace.id);
 
           setConversationSending(output.conversationId, false);
         }
 
-        if (activeAgent.role !== "main") {
+        if (targetAgent.role !== "main") {
           // Sub-agent: show pending message optimistically, backend saves via runAgentWithConversation
           const cid = conversationId ?? "";
           if (cid) {
             const content: TextMessageContent = { text };
             const input: CreateMessageInput = {
-              workspaceId: activeWorkspace.id,
+              workspaceId: targetWorkspaceId,
               conversationId: cid,
               senderType: "user",
               senderId: LOCAL_USER_ID,
@@ -358,8 +374,8 @@ export function ChatWindow() {
           }
 
           const output = await runAgentWithConversationStreaming({
-            workspaceId: activeWorkspace.id,
-            agentId: activeAgent.id,
+            workspaceId: targetWorkspaceId,
+            agentId: targetAgent.id,
             conversationId,
             message: text,
             resume: Boolean(conversationId)
@@ -367,15 +383,17 @@ export function ChatWindow() {
 
           // If a new conversation was created, update the store
           if (!conversationId && output.conversationId) {
-            void loadWorkspaceTree(activeWorkspace.id);
+            await loadWorkspaceTree(targetWorkspaceId);
+            selectChat(output.conversationId);
+          } else {
+            void loadWorkspaceTree(targetWorkspaceId);
           }
 
           notifyAgentRunArtifacts(
-            activeWorkspace.id,
+            targetWorkspaceId,
             output.diffProposal,
             output.artifacts ?? []
           );
-          void loadWorkspaceTree(activeWorkspace.id);
 
           setConversationSending(output.conversationId, false);
         }
@@ -411,15 +429,22 @@ export function ChatWindow() {
         message: string;
         resume?: boolean;
       }): Promise<RunAgentOutput & { conversationId: string; usedFallback?: boolean }> {
-        const currentAgent = activeAgent;
-        const currentWorkspace = activeWorkspace;
+        const currentState = workspaceStore.getState();
+        const currentAgent =
+          activeAgent?.id === input.agentId
+            ? activeAgent
+            : Object.values(currentState.agentsByWorkspace)
+                .flat()
+                .find((agent) => agent.id === input.agentId) ??
+              currentState.contacts.find((agent) => agent.id === input.agentId) ??
+              null;
 
-        if (!currentAgent || !currentWorkspace) {
+        if (!currentAgent) {
           throw new Error("未选择可用 Agent。");
         }
 
         const agent = currentAgent;
-        const workspace = currentWorkspace;
+        const workspaceId = input.workspaceId;
         let cid = input.conversationId ?? "";
         let streamMessageId: string | null = null;
         let streamedText = "";
@@ -469,7 +494,7 @@ export function ChatWindow() {
           const nextMessageId = messageId ?? getStreamMessageId();
           streamedText += text;
           const nextMessage = createStreamingAgentTextMessage({
-            workspaceId: workspace.id,
+            workspaceId,
             conversationId: cid,
             agentId: agent.id,
             id: nextMessageId,
@@ -509,7 +534,7 @@ export function ChatWindow() {
 
           if (!convMessages.some((message) => message.id === nextMessageId)) {
             const seed = createStreamingAgentTextMessage({
-              workspaceId: workspace.id,
+              workspaceId,
               conversationId: cid,
               agentId: agent.id,
               id: nextMessageId,
@@ -550,7 +575,7 @@ export function ChatWindow() {
 
           if (!existingMessage) {
             const seed = createStreamingAgentTextMessage({
-              workspaceId: workspace.id,
+              workspaceId,
               conversationId: cid,
               agentId: agent.id,
               id: nextMessageId,
@@ -747,7 +772,10 @@ export function ChatWindow() {
       activeAgent?.runtimeProvider,
       activeConversation,
       activeWorkspace,
+      activeWorkspaceAgents,
+      contacts,
       loadWorkspaceTree,
+      selectChat,
       setConversationMessages,
       setConversationSending,
       setConversationActiveRunId

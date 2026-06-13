@@ -120,9 +120,11 @@ function getWebToolDefinitions(input: AgentRunInput): LLMToolDefinition[] {
 }
 
 function getCreateArtifactToolDefinition(input: AgentRunInput): LLMToolDefinition[] {
-  return hasToolPermission(input, "previewArtifact")
-    ? [CREATE_ARTIFACT_TOOL_DEFINITION]
-    : [];
+  const isEphemeralContext = input.runOptions?.mode === "group_subagent";
+  if (!isEphemeralContext || !hasToolPermission(input, "previewArtifact")) {
+    return [];
+  }
+  return [CREATE_ARTIFACT_TOOL_DEFINITION];
 }
 
 function getAgentToolNames(tools: LLMToolDefinition[]): Set<AgentToolName> {
