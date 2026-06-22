@@ -8982,6 +8982,9 @@ h2,
   --ah-blue-strong: #5f7eea;
   --ah-border-soft: rgba(121, 157, 145, 0.16);
   --ah-border-strong: rgba(121, 157, 145, 0.26);
+  --ah-sidebar-glass: rgba(255, 255, 255, 0.62);
+  --ah-sidebar-glass-strong: rgba(255, 255, 255, 0.78);
+  --ah-sidebar-border: rgba(121, 157, 145, 0.2);
   --ah-shadow-soft: 0 18px 60px rgba(65, 104, 90, 0.1);
   --ah-shadow-card: 0 8px 28px rgba(80, 110, 100, 0.08);
   --ah-shadow-hover: 0 14px 34px rgba(65, 104, 90, 0.12);
@@ -8991,8 +8994,11 @@ h2,
   --ah-radius-lg: 24px;
   --ah-radius-xl: 32px;
   --ah-radius-pill: 999px;
+  --ah-panel-radius: 19px;
+  --ah-panel-inner-radius: 18px;
   --ah-rail-width: 72px;
   --ah-sidebar-width: 320px;
+  --ah-sidebar-gap: 3px;
   --ah-inspector-width: 520px;
   --color-app-bg: var(--ah-bg);
   --color-surface: var(--ah-surface);
@@ -9073,8 +9079,10 @@ textarea:focus-visible {
 }
 
 .app-shell {
-  grid-template-columns: calc(var(--ah-rail-width) + var(--ah-sidebar-width)) minmax(0, 1fr);
-  gap: 18px;
+  grid-template-columns:
+    calc(var(--ah-rail-width) + var(--ah-sidebar-width) + var(--ah-sidebar-gap))
+    minmax(0, 1fr);
+  gap: 3px;
   width: 100%;
   height: 100%;
   min-height: 680px;
@@ -9089,7 +9097,7 @@ textarea:focus-visible {
 
 .app-shell.inspector-open {
   grid-template-columns:
-    calc(var(--ah-rail-width) + var(--ah-sidebar-width))
+    calc(var(--ah-rail-width) + var(--ah-sidebar-width) + var(--ah-sidebar-gap))
     minmax(0, 1fr)
     minmax(360px, var(--ah-inspector-width));
 }
@@ -9113,7 +9121,7 @@ textarea:focus-visible {
 .hub-sidebar {
   display: grid;
   grid-template-columns: var(--ah-rail-width) minmax(0, var(--ah-sidebar-width));
-  gap: 14px;
+  gap: var(--ah-sidebar-gap);
   min-width: 0;
   min-height: 0;
   border: 0;
@@ -9136,31 +9144,48 @@ textarea:focus-visible {
 }
 
 .hub-rail {
+  position: relative;
   width: var(--ah-rail-width);
   min-width: var(--ah-rail-width);
   min-height: 0;
   align-items: center;
-  gap: 10px;
-  padding: 16px 10px;
-  border: 1px solid var(--ah-border-soft);
-  border-radius: var(--ah-radius-xl);
+  gap: 12px;
+  padding: 18px 10px;
+  border: 1px solid var(--ah-sidebar-border);
+  border-radius: var(--ah-panel-radius);
   color: var(--ah-text-secondary);
-  background: var(--ah-surface);
-  box-shadow: var(--ah-shadow-card);
-  -webkit-backdrop-filter: blur(18px);
-  backdrop-filter: blur(18px);
+  background:
+    radial-gradient(circle at 50% 0%, rgba(221, 243, 236, 0.88), transparent 42%),
+    linear-gradient(180deg, rgba(255, 255, 255, 0.76), rgba(255, 255, 255, 0.5));
+  box-shadow:
+    0 22px 58px rgba(65, 104, 90, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.78);
+  -webkit-backdrop-filter: blur(22px) saturate(1.12);
+  backdrop-filter: blur(22px) saturate(1.12);
+  overflow: hidden;
+}
+
+.hub-rail::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: var(--ah-panel-inner-radius);
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.36), transparent 44%);
+  pointer-events: none;
 }
 
 .hub-logo {
   width: 48px;
   height: 48px;
-  margin: 0 auto 12px;
-  border: 1px solid rgba(255, 255, 255, 0.72);
-  border-radius: 18px;
+  margin: 0 auto 14px;
+  border: 1px solid rgba(255, 255, 255, 0.84);
+  border-radius: 19px;
   color: #ffffff;
   background:
-    linear-gradient(145deg, rgba(127, 203, 183, 0.98), rgba(75, 166, 144, 0.96));
-  box-shadow: 0 10px 24px rgba(75, 166, 144, 0.2);
+    linear-gradient(145deg, rgba(127, 203, 183, 0.98), rgba(47, 141, 120, 0.96));
+  box-shadow:
+    0 12px 26px rgba(75, 166, 144, 0.22),
+    inset 0 1px 0 rgba(255, 255, 255, 0.2);
   font-size: 13px;
 }
 
@@ -9176,6 +9201,12 @@ textarea:focus-visible {
   color: var(--ah-text-secondary);
   background: transparent;
   box-shadow: none;
+  transition:
+    transform 140ms ease,
+    border-color 140ms ease,
+    background-color 140ms ease,
+    box-shadow 140ms ease,
+    color 140ms ease;
 }
 
 .hub-rail button svg,
@@ -9189,17 +9220,20 @@ textarea:focus-visible {
 
 .hub-rail button:hover,
 .hub-rail button:focus-visible {
-  border-color: var(--ah-border-soft);
+  border-color: rgba(75, 166, 144, 0.22);
   color: var(--ah-mint-strong);
-  background: var(--ah-mint-faint);
-  box-shadow: none;
+  background: rgba(255, 255, 255, 0.52);
+  box-shadow: 0 8px 20px rgba(65, 104, 90, 0.08);
+  transform: translateY(-1px);
 }
 
 .hub-rail button.active {
-  border-color: rgba(75, 166, 144, 0.3);
+  border-color: rgba(255, 255, 255, 0.9);
   color: var(--ah-mint-strong);
-  background: rgba(255, 255, 255, 0.86);
-  box-shadow: var(--ah-shadow-card);
+  background: rgba(255, 255, 255, 0.92);
+  box-shadow:
+    0 12px 28px rgba(65, 104, 90, 0.13),
+    inset 0 1px 0 rgba(255, 255, 255, 0.82);
 }
 
 .hub-rail button span,
@@ -9212,27 +9246,61 @@ textarea:focus-visible {
 }
 
 .hub-list-pane {
+  position: relative;
   display: flex;
   min-width: 0;
   min-height: 0;
   flex-direction: column;
-  border: 1px solid var(--ah-border-soft);
-  border-radius: var(--ah-radius-xl);
-  background: var(--ah-surface);
-  box-shadow: var(--ah-shadow-card);
-  -webkit-backdrop-filter: blur(18px);
-  backdrop-filter: blur(18px);
+  border: 1px solid var(--ah-sidebar-border);
+  border-radius: var(--ah-panel-radius);
+  background:
+    radial-gradient(circle at 18% 0%, rgba(221, 243, 236, 0.62), transparent 34%),
+    linear-gradient(180deg, var(--ah-sidebar-glass-strong), var(--ah-sidebar-glass));
+  box-shadow:
+    0 24px 68px rgba(65, 104, 90, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.76);
+  -webkit-backdrop-filter: blur(22px) saturate(1.12);
+  backdrop-filter: blur(22px) saturate(1.12);
   overflow: hidden;
+  transition:
+    opacity 180ms ease,
+    transform 180ms ease;
+}
+
+.hub-list-pane::before {
+  content: "";
+  position: absolute;
+  inset: 1px;
+  border-radius: var(--ah-panel-inner-radius);
+  background: linear-gradient(135deg, rgba(255, 255, 255, 0.42), transparent 44%);
+  pointer-events: none;
+}
+
+.hub-sidebar.list-pane-collapsed .hub-list-pane {
+  transform: translateX(-8px) scale(0.98);
+}
+
+.hub-list-header,
+.hub-contact-list {
+  position: relative;
+  z-index: 1;
 }
 
 .hub-list-header {
-  padding: 24px 22px 18px;
+  padding: 26px 24px 18px;
   border-bottom: 0;
   background: transparent;
 }
 
+.hub-list-header h1 {
+  color: var(--ah-text-primary);
+  font-size: 28px;
+  font-weight: 780;
+  line-height: 1.1;
+}
+
 .hub-list-header p {
-  margin: 6px 0 0;
+  margin: 8px 0 0;
   color: var(--ah-text-secondary);
   font-size: 13px;
   line-height: 1.45;
@@ -9252,20 +9320,31 @@ textarea:focus-visible {
 .hub-contact-list {
   display: grid;
   align-content: start;
-  gap: 10px;
+  gap: 9px;
   min-height: 0;
-  padding: 0 14px 18px;
+  padding: 0 16px 20px;
   overflow: auto;
+  scrollbar-width: thin;
+}
+
+.hub-contact-list h3 {
+  margin: 14px 4px 4px;
+  color: var(--ah-text-tertiary);
+  font-size: 11px;
+  font-weight: 860;
+  letter-spacing: 0.04em;
+  line-height: 1.2;
+  text-transform: uppercase;
 }
 
 .hub-chat-item,
 .hub-contact-item {
-  border: 1px solid transparent;
+  border: 1px solid rgba(255, 255, 255, 0.42);
   border-bottom: 0;
-  border-radius: var(--ah-radius-lg);
+  border-radius: 22px;
   color: var(--ah-text-primary);
-  background: rgba(255, 255, 255, 0.52);
-  box-shadow: none;
+  background: rgba(255, 255, 255, 0.48);
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.44);
   transition:
     transform 120ms ease,
     border-color 120ms ease,
@@ -9279,25 +9358,30 @@ textarea:focus-visible {
 }
 
 .hub-contact-item {
-  min-height: 58px;
-  padding: 9px 10px;
+  min-height: 60px;
+  padding: 10px 11px;
 }
 
 .hub-chat-item:hover,
 .hub-chat-item:focus-visible,
 .hub-contact-item:hover,
 .hub-contact-item:focus-visible {
-  border-color: var(--ah-border-strong);
+  border-color: rgba(75, 166, 144, 0.24);
   background: rgba(255, 255, 255, 0.76);
-  box-shadow: var(--ah-shadow-card);
+  box-shadow:
+    0 12px 28px rgba(65, 104, 90, 0.1),
+    inset 0 1px 0 rgba(255, 255, 255, 0.62);
   transform: translateY(-1px);
 }
 
 .hub-chat-item.active,
 .hub-contact-item.active {
-  border: 1px solid rgba(75, 166, 144, 0.45);
-  background: rgba(255, 255, 255, 0.82);
-  box-shadow: 0 14px 34px rgba(65, 104, 90, 0.12);
+  border: 1px solid rgba(75, 166, 144, 0.32);
+  background:
+    linear-gradient(135deg, rgba(221, 243, 236, 0.9), rgba(255, 255, 255, 0.78));
+  box-shadow:
+    0 14px 34px rgba(65, 104, 90, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.68);
 }
 
 .hub-avatar,
@@ -9319,7 +9403,7 @@ textarea:focus-visible {
 .hub-contact-item .hub-avatar {
   width: 38px;
   height: 38px;
-  border-radius: 14px;
+  border-radius: 15px;
 }
 
 .hub-avatar--agent {
@@ -9337,8 +9421,8 @@ textarea:focus-visible {
 .hub-chat-copy strong,
 .hub-contact-copy strong {
   color: var(--ah-text-primary);
-  font-size: 14px;
-  font-weight: 780;
+  font-size: 13px;
+  font-weight: 820;
 }
 
 .hub-chat-copy small,
@@ -9346,6 +9430,33 @@ textarea:focus-visible {
 .hub-empty-copy,
 .hub-contact-copy small {
   color: var(--ah-text-secondary);
+}
+
+.hub-pin-indicator {
+  width: 24px;
+  height: 24px;
+  border-radius: var(--ah-radius-pill);
+  color: #2f8d78;
+  background: rgba(221, 243, 236, 0.72);
+}
+
+.hub-pin-indicator svg {
+  width: 13px;
+  height: 13px;
+  fill: currentColor;
+  fill-opacity: 0.22;
+}
+
+.hub-nav-tooltip {
+  padding: 7px 11px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+  background: rgba(22, 33, 29, 0.82);
+  box-shadow: 0 12px 28px rgba(15, 23, 26, 0.18);
+  font-weight: 720;
+  letter-spacing: 0;
+  -webkit-backdrop-filter: blur(12px);
+  backdrop-filter: blur(12px);
 }
 
 .add-agent-button,
@@ -9371,7 +9482,7 @@ textarea:focus-visible {
   min-width: 0;
   min-height: 0;
   border: 1px solid var(--ah-border-soft);
-  border-radius: var(--ah-radius-xl);
+  border-radius: var(--ah-panel-radius);
   background: var(--ah-surface);
   box-shadow: var(--ah-shadow-soft);
   -webkit-backdrop-filter: blur(18px);
@@ -9482,7 +9593,7 @@ textarea:focus-visible {
   gap: 14px;
   padding: 20px;
   border: 1px solid var(--ah-border-soft);
-  border-radius: var(--ah-radius-xl);
+  border-radius: var(--ah-panel-radius);
   background: rgba(255, 255, 255, 0.8);
   box-shadow: -18px 20px 70px rgba(65, 104, 90, 0.16);
   -webkit-backdrop-filter: blur(20px);
