@@ -18,7 +18,7 @@ import {
   getRunningAgentRunByConversation
 } from "../db/repositories/agentRunRepo";
 import type { RuntimeProvider } from "../../shared/runtime";
-import type { AgentEvent, AgentAdapter } from "../../shared/agentAdapter";
+import type { AgentEvent, AgentAdapter, AgentRunInput } from "../../shared/agentAdapter";
 import {
   ConversationNotFoundError,
   ProviderMismatchError,
@@ -723,6 +723,70 @@ describe("runAgentWithConversation", () => {
       const text = (message.content as { text?: string }).text ?? "";
       return text.includes("SEARCH");
     })).toBe(false);
+    expect(getDiffProposalsByConversation(conversation.id, db)).toHaveLength(1);
+  });
+
+  it("auto-repairs a deliverable reply that only asks for clarification", async () => {
+    const { workspace, agent, conversation } = await setupWorkspaceAndAgent();
+    const db = getDatabase();
+    const sr_s = `${"<".repeat(7)} SEARCH`;
+    const sr_d = "=".repeat(7);
+    const sr_r = `${">".repeat(7)} REPLACE`;
+    const capturedInputs: AgentRunInput[] = [];
+    const mockAdapter: AgentAdapter = {
+      async *run(input) {
+        capturedInputs.push(input);
+        if (capturedInputs.length === 1) {
+          yield {
+            type: "text_delta",
+            content: "在创建 PPT 文件前，需要先确认一个关键信息："
+          };
+          yield { type: "status", status: "completed" };
+          return;
+        }
+
+        yield {
+          type: "text_delta",
+          content: [
+            "已按通用飞书产品介绍场景生成一版可预览 PPT。",
+            "",
+            "src/feishu-intro.html",
+            "```",
+            sr_s,
+            sr_d,
+            "<!doctype html>",
+            "<html><body><section><h1>飞书产品介绍</h1><p>协作、沟通与知识管理一体化。</p></section></body></html>",
+            sr_r,
+            "```"
+          ].join("\n")
+        };
+        yield { type: "status", status: "completed" };
+      }
+    };
+
+    const result = await runAgentWithConversation(
+      {
+        workspaceId: workspace.id,
+        agentId: agent.id,
+        conversationId: conversation.id,
+        message: "帮我做一个飞书产品 PPT"
+      },
+      db,
+      undefined,
+      mockAdapter
+    );
+
+    expect(capturedInputs).toHaveLength(2);
+    expect(capturedInputs[1].userMessage).toContain("上一轮没有生成用户请求的可预览产物");
+    expect(result.status).toBe("available");
+    expect(result.runResult?.status).toBe("completed");
+    expect(result.messages.some((message) => message.messageType === "diff_card")).toBe(true);
+    expect(
+      result.messages.some((message) => {
+        const text = (message.content as { text?: string }).text ?? "";
+        return text.includes("需要先确认一个关键信息");
+      })
+    ).toBe(false);
     expect(getDiffProposalsByConversation(conversation.id, db)).toHaveLength(1);
   });
 

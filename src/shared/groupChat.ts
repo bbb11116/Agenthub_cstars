@@ -74,10 +74,13 @@ export type SubAgentResultMetadata = {
   timeoutTriggered?: boolean;
   continuationAttempts?: number;
   recoveredFromTruncation?: boolean;
+  deliverableValidationFailed?: boolean;
+  localRepairExhausted?: boolean;
+  invalidArtifactIds?: string[];
 };
 
 export type SubAgentOutputRef = {
-  type: "markdown" | "text" | "diff" | "file" | "json" | "command_result";
+  type: "markdown" | "html" | "text" | "diff" | "file" | "json" | "command_result";
   artifactId?: string;
   diffProposalId?: string;
   filePath?: string;

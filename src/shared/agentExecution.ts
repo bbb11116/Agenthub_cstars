@@ -22,6 +22,15 @@ export type AgentRunOptions = {
   disableStream?: boolean;
 };
 
+export type AgentArtifactTarget = {
+  workspaceId: string;
+  conversationId: string;
+  workspaceRootPath?: string;
+  workspaceContextId?: string | null;
+  dispatchRunId?: string;
+  dispatchStepId?: string;
+};
+
 export type AgentRunResult = {
   status:
     | "completed"
@@ -36,4 +45,3 @@ export type AgentRunResult = {
   error?: string;
   iterationsUsed?: number;
 };
-

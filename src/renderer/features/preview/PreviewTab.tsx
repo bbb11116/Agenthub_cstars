@@ -166,6 +166,7 @@ export function PreviewTab({ artifactId, onOpenDiff }: PreviewTabProps) {
 
       <ArtifactViewer
         artifact={artifact}
+        scaled
         onArtifactUpdated={(updated) =>
           setPreviewState({ status: "ready", artifact: updated, error: null })
         }

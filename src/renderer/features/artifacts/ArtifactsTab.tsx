@@ -42,8 +42,67 @@ function formatArtifactType(type: Artifact["type"]): string {
   }
 }
 
+function isRuntimeContractWrapperContent(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ").trim();
+  return (
+    /(?:The user asked|this round I am only asked|tool has returned|No further tool calls|required|runtime contract|completion result)/i.test(compact) &&
+    /(?:create_artifact|artifactIds|artifactId|outputs|evidence|policy_check|create_artifact_response)/i.test(compact)
+  );
+}
+
+function isProcessOnlyContent(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ").trim();
+  if (!compact || compact.length > 220) {
+    return false;
+  }
+
+  return /^(?:let me|i(?:'ll| will| am going to)|getting|checking|fetching|searching|now I|okay|sure|好的|我来|我将|正在|继续|先查|先获取|让我)/i.test(compact);
+}
+
+function isPlaceholderContent(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return true;
+  }
+
+  if (compact.length > 320) {
+    return false;
+  }
+
+  return /(?:已创建|创建完成|成功创建|已生成|生成完成|继续生成|正在生成|artifact 已成功创建|previewArtifact|PPT 已创建|HTML 已创建|报告已创建|created|continue generating|placeholder)/i.test(compact);
+}
+
+function isDebugArtifact(artifact: Artifact): boolean {
+  if (artifact.metadata?.official === false) {
+    return true;
+  }
+
+  if (
+    artifact.metadata?.origin === "synthetic_wrapper" ||
+    artifact.metadata?.origin === "intermediate"
+  ) {
+    return true;
+  }
+
+  if (artifact.metadata?.origin === "fallback_parse_dump" && artifact.metadata.official !== true) {
+    return true;
+  }
+
+  if (artifact.type !== "markdown") {
+    return false;
+  }
+
+  const stepDeliverableTitle = /\bStep\s+\d+\s+Deliverable\b/i.test(artifact.title);
+  if (isRuntimeContractWrapperContent(artifact.content)) {
+    return true;
+  }
+
+  return stepDeliverableTitle && (isProcessOnlyContent(artifact.content) || isPlaceholderContent(artifact.content));
+}
+
 export function ArtifactsTab({ activeArtifactId, onOpenArtifact }: ArtifactsTabProps) {
   const { activeWorkspace } = useWorkspaceStore();
+  const [showDebugArtifacts, setShowDebugArtifacts] = useState(false);
   const [artifactState, setArtifactState] = useState<ArtifactsTabViewState>({
     ...initialArtifactsTabState,
     activeArtifactId
@@ -196,10 +255,41 @@ export function ArtifactsTab({ activeArtifactId, onOpenArtifact }: ArtifactsTabP
     );
   }
 
+  const visibleArtifacts = showDebugArtifacts
+    ? artifactState.artifacts
+    : artifactState.artifacts.filter((artifact) => !isDebugArtifact(artifact));
+
+  if (visibleArtifacts.length === 0) {
+    return (
+      <div className="artifacts-tab inspector-content" aria-label="Artifacts">
+        <label className="artifact-debug-toggle">
+          <input
+            type="checkbox"
+            checked={showDebugArtifacts}
+            onChange={(event) => setShowDebugArtifacts(event.currentTarget.checked)}
+          />
+          <span>Show debug artifacts</span>
+        </label>
+        <div className="placeholder-block">
+          <span className="placeholder-title">No Deliverables</span>
+          <span className="placeholder-muted">Only intermediate artifacts are available.</span>
+        </div>
+      </div>
+    );
+  }
+
   return (
     <div className="artifacts-tab inspector-content" aria-label="Artifacts">
+      <label className="artifact-debug-toggle">
+        <input
+          type="checkbox"
+          checked={showDebugArtifacts}
+          onChange={(event) => setShowDebugArtifacts(event.currentTarget.checked)}
+        />
+        <span>Show debug artifacts</span>
+      </label>
       <div className="artifact-list">
-        {artifactState.artifacts.map((artifact) => {
+        {visibleArtifacts.map((artifact) => {
           const subtitle = `${formatArtifactType(artifact.type)}${artifact.filePath ? ` - ${artifact.filePath}` : ""}`;
           return (
             <button

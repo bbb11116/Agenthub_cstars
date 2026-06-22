@@ -364,12 +364,16 @@ function buildFallbackEventsFromMessages(messages: ChatMessage[]): GroupRunEvent
   return events;
 }
 
-function mergeGroupRunEvents(
+export function mergeGroupRunEvents(
   fallbackEvents: GroupRunEvent[],
   realEvents: GroupRunEvent[]
 ): GroupRunEvent[] {
+  const realPlanRunIds = new Set<string>();
   const realStepKeys = new Set<string>();
   for (const event of realEvents) {
+    if (event.type === "plan_created") {
+      realPlanRunIds.add(event.groupRunId);
+    }
     if (
       event.type !== "agent_started" &&
       event.type !== "agent_progress" &&
@@ -386,6 +390,9 @@ function mergeGroupRunEvents(
 
   const byId = new Map<string, GroupRunEvent>();
   for (const event of fallbackEvents) {
+    if (event.type === "plan_created" && realPlanRunIds.has(event.groupRunId)) {
+      continue;
+    }
     if (
       event.type === "agent_started" ||
       event.type === "agent_progress" ||

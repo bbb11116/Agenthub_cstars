@@ -38,6 +38,7 @@ function isStringArray(value: unknown): value is string[] {
 function isOutputType(value: unknown): value is SubAgentOutputRef["type"] {
   return (
     value === "markdown" ||
+    value === "html" ||
     value === "text" ||
     value === "diff" ||
     value === "file" ||
@@ -377,6 +378,9 @@ function createRepairAssignments(
     const latestResult = [...results]
       .reverse()
       .find((result) => result.agentId === assignment.agentId);
+    if (latestResult?.metadata?.localRepairExhausted) {
+      continue;
+    }
     const repairInstruction = latestResult?.nextSuggestedTask?.trim();
     const repairedNodeId = assignment.subTask?.id ?? assignment.id;
     const dependsOn = [...new Set([
@@ -389,9 +393,16 @@ function createRepairAssignments(
       agentId: assignment.agentId,
       instruction: [
         `修复上一轮未完成验收项: ${targetCriteria.join(", ")}`,
-        repairInstruction || assignment.instruction,
-        "不要重复处理已经满足的验收项。"
-      ].join("\n"),
+        "必须继续执行同一个原始子任务，不得改换交付物类型、业务主体或新增未指定对象。",
+        "原始子任务:",
+        assignment.instruction,
+        repairInstruction ? "上一轮建议修复动作:" : "",
+        repairInstruction ?? "",
+        "只修复上述原始子任务中未完成的部分；不要重复处理已经满足的验收项。",
+        "如果原始子任务要求某种 artifact 类型，修复结果必须仍然生成该类型 artifact。"
+      ]
+        .filter((line) => line.trim().length > 0)
+        .join("\n"),
       targetCriteria,
       dependsOn,
       reason: "上一轮审核仍有未完成验收项。"

@@ -1641,6 +1641,34 @@ h2 {
   color: #5f5b54;
 }
 
+.diff-card.diff-card-message {
+  gap: 8px;
+  padding: 9px 12px;
+}
+
+.diff-card-message-line {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 4px 8px;
+  min-width: 0;
+}
+
+.diff-card-message-title {
+  color: #24322f;
+  font-size: 13px;
+  font-weight: 850;
+  line-height: 1.25;
+}
+
+.diff-card-message-meta {
+  color: #67645d;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
 .agent-config-card {
   display: grid;
   gap: 13px;
@@ -2402,6 +2430,22 @@ h2 {
   gap: 4px;
   min-height: 0;
   overflow: auto;
+}
+
+.artifact-debug-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: #6f7672;
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.artifact-debug-toggle input {
+  width: 13px;
+  height: 13px;
+  margin: 0;
 }
 
 .artifact-list button {
@@ -6244,9 +6288,7 @@ h2 {
 .artifact-preview-card-body .artifact-viewer,
 .artifact-preview-card-body .preview-body,
 .artifact-preview-card-body .html-preview-frame,
-.artifact-preview-card-body .scaled-html-frame,
-.artifact-preview-card-body .artifact-pdf-frame,
-.artifact-preview-card-body .zoomable-preview {
+.artifact-preview-card-body .artifact-pdf-frame {
   height: 100%;
   min-height: 0;
 }
@@ -6297,6 +6339,16 @@ h2 {
   background: #ffffff;
 }
 
+.scaled-html-frame-centerer {
+  display: flex;
+  align-items: center;
+  align-items: safe center;
+  justify-content: center;
+  width: 100%;
+  min-width: 0;
+  min-height: 100%;
+}
+
 .scaled-html-frame-iframe {
   position: absolute;
   top: 0;
@@ -6307,46 +6359,6 @@ h2 {
   background: #ffffff;
   transform: scale(var(--scaled-html-scale, 1));
   transform-origin: top left;
-}
-
-.zoomable-preview {
-  position: relative;
-  overflow: auto;
-  flex: 1;
-  min-height: 0;
-}
-
-.zoomable-preview.zoomed {
-  cursor: zoom-out;
-}
-
-.zoomable-preview-content {
-  min-height: 100%;
-  min-width: 100%;
-}
-
-.zoomable-preview-overlay {
-  position: absolute;
-  inset: 0;
-  z-index: 1;
-}
-
-.zoomable-preview.compact {
-  max-height: 360px;
-}
-
-.zoomable-preview-indicator {
-  position: sticky;
-  bottom: 8px;
-  float: right;
-  margin-right: 8px;
-  padding: 2px 8px;
-  border-radius: 4px;
-  background: rgba(0, 0, 0, 0.6);
-  color: #fff;
-  font-size: 11px;
-  pointer-events: none;
-  z-index: 1;
 }
 
 .artifact-preview-error {
@@ -6481,9 +6493,7 @@ h2 {
 .artifact-overlay-preview .artifact-viewer,
 .artifact-overlay-preview .preview-body,
 .artifact-overlay-preview .html-preview-frame,
-.artifact-overlay-preview .scaled-html-frame,
-.artifact-overlay-preview .artifact-pdf-frame,
-.artifact-overlay-preview .zoomable-preview {
+.artifact-overlay-preview .artifact-pdf-frame {
   height: 100%;
   min-height: 0;
 }
@@ -9594,7 +9604,6 @@ body.inspector-resizing .app-shell {
 }
 
 .preview-tab .artifact-viewer,
-.preview-tab .zoomable-preview,
 .preview-tab .preview-body,
 .preview-tab .html-preview-frame,
 .preview-tab .artifact-pdf-frame {

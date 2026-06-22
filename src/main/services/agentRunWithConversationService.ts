@@ -10,6 +10,7 @@ import type { RuntimeProvider } from "../../shared/runtime";
 import type { AgentAdapter, AgentEvent, AgentRunInput } from "../../shared/agentAdapter";
 import {
   AGENT_EXECUTION_LIMITS,
+  type AgentArtifactTarget,
   type AgentExecutionMode,
   type AgentRunOptions,
   type AgentRunResult
@@ -77,6 +78,24 @@ import { buildAgentSkillsSystemPrompt } from "./agentSkillCatalogService";
 
 export type RunWithConversationStreamSink = (event: RunAgentStreamEvent) => void;
 
+type PostProcessAssistantMessageResult = {
+  messageId: string;
+  rawText: string;
+  diffProposalCount: number;
+  htmlFallbackCreated: boolean;
+};
+
+type LegacyDeliverableRepairResult = {
+  text: string;
+  thinking: string;
+  processed: Awaited<ReturnType<typeof createDiffProposalFromText>>;
+  diffProposalId?: string;
+  runError?: string;
+  runResultStatus: AgentRunResult["status"];
+  agentStatus: "available" | "error" | "unavailable";
+  iterationsUsed?: number;
+};
+
 const DIRECT_EDIT_POLICY = [
   "AgentHub workspace editing policy:",
   "Language policy: follow the user's latest message language. If the user writes in Chinese, answer in Chinese unless they explicitly request another language.",
@@ -97,8 +116,59 @@ const GROUP_SUBAGENT_POLICY = [
   "You only handle the assigned acceptance criteria.",
   "For assigned code or file modification criteria, emit a SEARCH/REPLACE block as plain text in your reply. The user reviews and applies via the AgentHub UI. SEARCH/REPLACE is TEXT, not a tool call.",
   "For analysis, explanation, review, or report criteria, do not emit a SEARCH/REPLACE block.",
+  "When the assigned task asks for a report, summary, HTML page, slide deck, PPT, preview, or other inspectable deliverable, create the deliverable with create_artifact first, then reference that artifactId in the final SubAgentResult JSON.",
+  "For markdown reports or research summaries, create a type=markdown artifact. For HTML pages or slide decks, create a type=html artifact.",
+  "Slide-deck HTML format: for PPT / slide deck / 演示稿 deliverables, create ONE single HTML document with all slides stacked vertically in source order. The user navigates by scrolling the preview vertically.",
+  "Do NOT add JavaScript-based navigation, onclick/onkeydown handlers, prev/next buttons, page indicators, keyboard shortcuts, swipe gestures, click regions, or any interactive slide controls. These controls are unsupported by the AgentHub preview platform.",
   "Return one SubAgentResult JSON object as your final message."
 ].join("\n");
+
+const DELIVERABLE_REQUEST_PATTERN =
+  /(?:ppt|pptx|slide\s*deck|slides?|deck|presentation|keynote|幻灯片|演示文稿|演示|简报|汇报|路演|预览|preview|demo|mock-?up|原型|页面|网页|html|landing\s*page|文档|document|报告|介绍页)/i;
+
+const CLARIFICATION_ONLY_PATTERN =
+  /(?:需要|需|请|先|before|need to|clarify|confirm).{0,80}(?:确认|澄清|补充|提供|告诉|说明|选择|明确|信息|版本|场景|受众|confirm|clarify|provide|choose|know|information|audience|version|scenario)/i;
+
+function requestsDeliverable(message: string): boolean {
+  return DELIVERABLE_REQUEST_PATTERN.test(message);
+}
+
+function looksLikeNonDeliveringDeliverableReply(text: string): boolean {
+  const trimmed = text.trim();
+  if (trimmed.length === 0) {
+    return true;
+  }
+
+  return looksLikeAnticipatoryReply(trimmed) || CLARIFICATION_ONLY_PATTERN.test(trimmed);
+}
+
+function buildDeliverableRepairPrompt(originalRequest: string, failedReply: string): string {
+  return [
+    "上一轮没有生成用户请求的可预览产物。现在必须自动修复，不要继续澄清。",
+    "",
+    "原始用户请求：",
+    originalRequest.trim(),
+    "",
+    "上一轮未完成回复：",
+    failedReply.trim().slice(0, 800) || "（空回复）",
+    "",
+    "请按最主流、通用的默认假设直接生成可预览产物。",
+    "如果是 PPT / slide deck / 演示文稿，请生成一个单文件 HTML slide deck，并用 SEARCH/REPLACE 新建合适的 .html 文件。",
+    "必须产出 SEARCH/REPLACE 块或 artifact；不要只提问题、不要只承诺会做。"
+  ].join("\n");
+}
+
+function shouldRepairMissingDeliverable(input: {
+  userMessage: string;
+  replyText: string;
+  hasDeliverableOutput: boolean;
+}): boolean {
+  return (
+    requestsDeliverable(input.userMessage) &&
+    !input.hasDeliverableOutput &&
+    looksLikeNonDeliveringDeliverableReply(input.replyText)
+  );
+}
 function formatToolPermissions(agent: Agent): string {
   return Object.entries({ ...agent.tools, applyDiff: false })
     .filter(([tool]) => tool !== "applyDiff")
@@ -267,6 +337,7 @@ export type RunWithConversationInput = {
   workspaceRootPath?: string;
   executionScope?: ProviderSessionExecutionScope;
   dispatchStepId?: string;
+  artifactTarget?: AgentArtifactTarget;
 };
 
 export type RunWithConversationResult = RunAgentOutput & {
@@ -512,6 +583,7 @@ export async function runAgentWithConversation(
       toolPermissions: [formatToolPermissions(agent)],
       claudeCodeConfig: agent.claudeCodeConfig,
       env: providerEnv,
+      artifactTarget: input.artifactTarget,
       runOptions,
       resume: {
         enabled: true,
@@ -547,6 +619,7 @@ export async function runAgentWithConversation(
       toolPermissions: [formatToolPermissions(agent)],
       claudeCodeConfig: agent.claudeCodeConfig,
       env: providerEnv,
+      artifactTarget: input.artifactTarget,
       runOptions,
       resume: {
         enabled: false,
@@ -578,6 +651,7 @@ export async function runAgentWithConversation(
       toolPermissions: [formatToolPermissions(agent)],
       claudeCodeConfig: agent.claudeCodeConfig,
       env: providerEnv,
+      artifactTarget: input.artifactTarget,
       runOptions,
       resume: { enabled: false }
     };
@@ -700,15 +774,20 @@ export async function runAgentWithConversation(
     }
   }
 
-  const hadExplicitNoChanges = explicitlyNeedsNoChanges(replyText);
-  const processedReply = replyText.trim()
+  let hadExplicitNoChanges = explicitlyNeedsNoChanges(replyText);
+  const artifactTarget = input.artifactTarget ?? {
+    workspaceId: workspace.id,
+    conversationId: conversation.id,
+    dispatchStepId: input.dispatchStepId
+  };
+  let processedReply = replyText.trim()
     ? await createDiffProposalFromText(
         {
-          workspaceId: workspace.id,
+          workspaceId: artifactTarget.workspaceId,
           agentId: agent.id,
-          conversationId: conversation.id,
+          conversationId: artifactTarget.conversationId,
           text: replyText,
-          dispatchStepId: input.dispatchStepId
+          dispatchStepId: artifactTarget.dispatchStepId
         },
         db
       )
@@ -721,6 +800,37 @@ export async function runAgentWithConversation(
   if (!diffProposalId && processedReply.diffProposals[0]) {
     diffProposalId = processedReply.diffProposals[0].id;
   }
+
+  const repair = shouldRepairMissingDeliverable({
+    userMessage: input.message,
+    replyText,
+    hasDeliverableOutput: Boolean(diffProposalId || processedReply.diffProposals.length > 0)
+  })
+    ? await runLegacyDeliverableRepair({
+        adapter,
+        adapterInput,
+        workspace,
+        agent,
+        conversation,
+        originalUserMessage: input.message,
+        failedReplyText: replyText,
+        db,
+        stream
+      })
+    : null;
+
+  if (repair) {
+    replyText = repair.text;
+    replyThinking = repair.thinking || replyThinking;
+    processedReply = repair.processed;
+    diffProposalId = repair.diffProposalId ?? diffProposalId;
+    runError = repair.runError;
+    runResultStatus = repair.runResultStatus;
+    agentStatus = repair.agentStatus;
+    iterationsUsed = repair.iterationsUsed ?? iterationsUsed;
+    hadExplicitNoChanges = explicitlyNeedsNoChanges(replyText);
+  }
+
   updateAgentRunRawOutput(agentRun.id, replyText, db);
 
   if (
@@ -871,6 +981,160 @@ export async function runAgentWithConversation(
       error: runError,
       iterationsUsed
     }
+  };
+}
+
+async function runLegacyDeliverableRepair(input: {
+  adapter: AgentAdapter;
+  adapterInput: AgentRunInput;
+  workspace: Workspace;
+  agent: Agent;
+  conversation: Conversation;
+  originalUserMessage: string;
+  failedReplyText: string;
+  db: AgentHubDatabase;
+  stream?: RunWithConversationStreamSink;
+}): Promise<LegacyDeliverableRepairResult | null> {
+  const repairPrompt = buildDeliverableRepairPrompt(
+    input.originalUserMessage,
+    input.failedReplyText
+  );
+  const repairInput: AgentRunInput = {
+    ...input.adapterInput,
+    userMessage: repairPrompt,
+    contextMessages: [
+      ...(input.adapterInput.contextMessages ?? []),
+      { role: "user", content: input.originalUserMessage },
+      { role: "assistant", content: input.failedReplyText }
+    ],
+    runOptions: {
+      ...input.adapterInput.runOptions,
+      prompt: repairPrompt,
+      structuredOutput: false
+    },
+    resume: { enabled: false }
+  };
+
+  let repairText = "";
+  let repairThinking = "";
+  let repairDiffProposalId: string | undefined;
+  let repairRunError: string | undefined;
+  let repairRunResultStatus: AgentRunResult["status"] = "completed";
+  let repairAgentStatus: "available" | "error" | "unavailable" = "available";
+  let repairIterationsUsed: number | undefined;
+
+  try {
+    for await (const event of runAdapterWithFallback(
+      input.adapter,
+      repairInput,
+      false,
+      undefined,
+      input.conversation,
+      input.workspace,
+      repairPrompt,
+      input.db
+    )) {
+      if (event.type === "text_delta") {
+        repairText += event.content;
+        input.stream?.({
+          type: "text_delta",
+          workspaceId: input.workspace.id,
+          conversationId: input.conversation.id,
+          agentId: input.agent.id,
+          text: event.content
+        });
+      } else if (event.type === "reasoning_delta") {
+        repairThinking += event.content;
+        input.stream?.({
+          type: "thinking_delta",
+          workspaceId: input.workspace.id,
+          conversationId: input.conversation.id,
+          agentId: input.agent.id,
+          text: event.content
+        });
+      } else if (event.type === "diff_proposal") {
+        if (
+          typeof event.proposal === "object" &&
+          event.proposal !== null &&
+          "id" in event.proposal &&
+          typeof event.proposal.id === "string"
+        ) {
+          repairDiffProposalId = event.proposal.id;
+        }
+      } else if (event.type === "error") {
+        repairRunError = event.message;
+        repairAgentStatus = "error";
+        repairRunResultStatus = "failed";
+      } else if (event.type === "status") {
+        repairIterationsUsed = event.iterationsUsed ?? repairIterationsUsed;
+        if (event.status === "failed") {
+          repairAgentStatus = "error";
+          repairRunResultStatus = "failed";
+        } else if (event.status === "iteration_limit_reached") {
+          repairAgentStatus = "error";
+          repairRunResultStatus = "iteration_limit_reached";
+        } else if (event.status === "waiting_for_permission") {
+          repairRunResultStatus = "waiting_for_permission";
+        } else if (event.status === "cancelled") {
+          repairRunResultStatus = "cancelled";
+        }
+      }
+    }
+  } catch (error) {
+    return {
+      text: input.failedReplyText,
+      thinking: "",
+      processed: {
+        text: input.failedReplyText,
+        diffProposals: [],
+        diffMessages: []
+      },
+      runError: error instanceof Error ? error.message : "Deliverable repair failed.",
+      runResultStatus: "failed",
+      agentStatus: "error"
+    };
+  }
+
+  if (repairText.trim().length === 0) {
+    return null;
+  }
+
+  const artifactTarget = input.adapterInput.artifactTarget ?? {
+    workspaceId: input.workspace.id,
+    conversationId: input.conversation.id,
+    dispatchStepId: undefined
+  };
+  const processed = await createDiffProposalFromText(
+    {
+      workspaceId: artifactTarget.workspaceId,
+      agentId: input.agent.id,
+      conversationId: artifactTarget.conversationId,
+      text: repairText,
+      dispatchStepId: artifactTarget.dispatchStepId
+    },
+    input.db
+  );
+  const diffProposalId = repairDiffProposalId ?? processed.diffProposals[0]?.id;
+
+  if (
+    shouldRepairMissingDeliverable({
+      userMessage: input.originalUserMessage,
+      replyText: processed.text,
+      hasDeliverableOutput: Boolean(diffProposalId || processed.diffProposals.length > 0)
+    })
+  ) {
+    return null;
+  }
+
+  return {
+    text: processed.text,
+    thinking: repairThinking,
+    processed,
+    diffProposalId,
+    runError: repairRunError,
+    runResultStatus: repairRunResultStatus,
+    agentStatus: repairAgentStatus,
+    iterationsUsed: repairIterationsUsed
   };
 }
 
@@ -1126,6 +1390,7 @@ export async function runAgentWithConversationUnified(
         userMessage: input.message,
         executionScope,
         dispatchStepId: input.dispatchStepId,
+        artifactTarget: input.artifactTarget,
         maxIterations,
         resume: input.resume,
         silent: input.silent
@@ -1166,6 +1431,7 @@ export async function runAgentWithConversationUnified(
   // service actually created in the DB. The DB row is the source of
   // truth — always look it up. See `findLatestAgentMessageId`.
   const resolvedAssistantMessageId = findLatestAgentMessageId(conversation.id, db);
+  let postProcessResult: PostProcessAssistantMessageResult | null = null;
   console.info("[AgentHub] runAgentWithConversationUnified: post-processing", {
     conversationId: conversation.id,
     resolvedAssistantMessageId,
@@ -1174,7 +1440,7 @@ export async function runAgentWithConversationUnified(
   });
   if (resolvedAssistantMessageId) {
     try {
-      await postProcessStreamingAssistantMessage({
+      postProcessResult = await postProcessStreamingAssistantMessage({
         workspaceId: workspace.id,
         agentId: agent.id,
         conversationId: conversation.id,
@@ -1188,6 +1454,54 @@ export async function runAgentWithConversationUnified(
     }
   }
 
+  if (
+    executionMode === "single_chat" &&
+    !input.silent &&
+    status === "completed" &&
+    resolvedAssistantMessageId &&
+    postProcessResult
+  ) {
+    const messageArtifacts = getArtifactsByMessage(resolvedAssistantMessageId, db);
+    const hasDeliverableOutput = Boolean(
+      postProcessResult.diffProposalCount > 0 ||
+      postProcessResult.htmlFallbackCreated ||
+      messageArtifacts.some((artifact) =>
+        artifact.type === "artifact_preview" || artifact.type === "diff_proposal"
+      )
+    );
+
+    if (
+      shouldRepairMissingDeliverable({
+        userMessage: input.message,
+        replyText: postProcessResult.rawText,
+        hasDeliverableOutput
+      })
+    ) {
+      const repairResult = await runUnifiedDeliverableRepair({
+        workspace,
+        agent,
+        conversation,
+        rootPath: executionWorkspace.rootPath,
+        workspaceContextId: resolvedWorkspace.workspaceContextId,
+        executionScope,
+        dispatchStepId: input.dispatchStepId,
+        artifactTarget: input.artifactTarget,
+        maxIterations,
+        originalUserMessage: input.message,
+        failedReplyText: postProcessResult.rawText,
+        streamSink,
+        db
+      });
+
+      if (repairResult) {
+        assistantMessageId = repairResult.assistantMessageId || assistantMessageId;
+        runId = repairResult.runId || runId;
+        status = repairResult.status;
+        errorMessage = repairResult.errorMessage ?? errorMessage;
+      }
+    }
+  }
+
   return {
     conversationId: conversation.id,
     runId: runId || "",
@@ -1196,6 +1510,110 @@ export async function runAgentWithConversationUnified(
     ...(errorMessage ? { errorMessage } : {}),
     agentId: agent.id
   };
+}
+
+async function runUnifiedDeliverableRepair(input: {
+  workspace: Workspace;
+  agent: Agent;
+  conversation: Conversation;
+  rootPath: string;
+  workspaceContextId: string | null;
+  executionScope: ProviderSessionExecutionScope;
+  dispatchStepId: string | undefined;
+  artifactTarget?: AgentArtifactTarget;
+  maxIterations: number;
+  originalUserMessage: string;
+  failedReplyText: string;
+  streamSink?: (event: AgentRunEvent) => void;
+  db: AgentHubDatabase;
+}): Promise<{
+  runId: string;
+  assistantMessageId: string;
+  status: "completed" | "failed" | "cancelled";
+  errorMessage?: string;
+} | null> {
+  const repairPrompt = buildDeliverableRepairPrompt(
+    input.originalUserMessage,
+    input.failedReplyText
+  );
+  let runId = "";
+  let status: "completed" | "failed" | "cancelled" = "completed";
+  let errorMessage: string | undefined;
+
+  try {
+    for await (const event of runStreamingAgent(
+      {
+        workspaceId: input.workspace.id,
+        agent: input.agent,
+        conversationId: input.conversation.id,
+        rootPath: input.rootPath,
+        workspaceContextId: input.workspaceContextId,
+        systemPrompt: buildDeliverableRepairSystemPrompt(input.agent, input.maxIterations),
+        userMessage: repairPrompt,
+        executionScope: input.executionScope,
+        dispatchStepId: input.dispatchStepId,
+        artifactTarget: input.artifactTarget,
+        maxIterations: input.maxIterations,
+        resume: false,
+        silent: true
+      },
+      input.db,
+      input.streamSink as StreamingRunSink | undefined
+    )) {
+      if (!runId) {
+        runId = event.runId;
+      }
+      if (event.type === "run.completed") {
+        status = event.payload.status;
+      } else if (event.type === "run.failed") {
+        status = "failed";
+        errorMessage = event.payload.message;
+      }
+    }
+  } catch (error) {
+    return {
+      runId,
+      assistantMessageId: "",
+      status: "failed",
+      errorMessage: error instanceof Error ? error.message : "Deliverable repair failed."
+    };
+  }
+
+  const assistantMessageId = findLatestAgentMessageId(input.conversation.id, input.db);
+  if (!assistantMessageId) {
+    return {
+      runId,
+      assistantMessageId: "",
+      status: "failed",
+      errorMessage: "Deliverable repair did not create an assistant message."
+    };
+  }
+
+  await postProcessStreamingAssistantMessage({
+    workspaceId: input.workspace.id,
+    agentId: input.agent.id,
+    conversationId: input.conversation.id,
+    messageId: assistantMessageId,
+    silent: false,
+    dispatchStepId: input.dispatchStepId,
+    db: input.db
+  });
+
+  return {
+    runId,
+    assistantMessageId,
+    status,
+    ...(errorMessage ? { errorMessage } : {})
+  };
+}
+
+function buildDeliverableRepairSystemPrompt(agent: Agent, maxIterations: number): string {
+  return [
+    buildEffectiveSystemPrompt(agent, "single_chat", maxIterations),
+    "Automatic repair mode: the previous assistant reply did not produce the requested deliverable. Produce the deliverable now. Do not ask clarifying questions."
+  ]
+    .filter((part) => part.trim().length > 0)
+    .join("\n\n");
 }
 
 function findLatestAgentMessageId(
@@ -1221,22 +1639,27 @@ async function postProcessStreamingAssistantMessage(input: {
   silent: boolean;
   dispatchStepId: string | undefined;
   db: AgentHubDatabase;
-}): Promise<void> {
-  if (input.silent) return;
+}): Promise<PostProcessAssistantMessageResult | null> {
+  if (input.silent) return null;
   const message = getMessageById(input.messageId, input.db);
   if (!message) {
     console.info("[AgentHub] postProcess: no message found", { messageId: input.messageId });
-    return;
+    return null;
   }
   const content = message.content;
   if (!content || typeof content !== "object" || !("text" in content)) {
     console.info("[AgentHub] postProcess: message has no text content", { messageId: input.messageId });
-    return;
+    return null;
   }
   const rawText = (content as { text?: unknown }).text;
   if (typeof rawText !== "string" || rawText.trim().length === 0) {
     console.info("[AgentHub] postProcess: text empty", { messageId: input.messageId });
-    return;
+    return {
+      messageId: input.messageId,
+      rawText: "",
+      diffProposalCount: 0,
+      htmlFallbackCreated: false
+    };
   }
 
   console.info("[AgentHub] postProcess: starting", {
@@ -1259,8 +1682,20 @@ async function postProcessStreamingAssistantMessage(input: {
     );
   } catch (error) {
     console.warn("[AgentHub] postProcess: createDiffProposalFromText threw", error);
-    return;
+    return {
+      messageId: input.messageId,
+      rawText,
+      diffProposalCount: 0,
+      htmlFallbackCreated: false
+    };
   }
+
+  const result: PostProcessAssistantMessageResult = {
+    messageId: input.messageId,
+    rawText,
+    diffProposalCount: processed.diffProposals.length,
+    htmlFallbackCreated: false
+  };
 
   console.info("[AgentHub] postProcess: parsed", {
     conversationId: input.conversationId,
@@ -1283,7 +1718,7 @@ async function postProcessStreamingAssistantMessage(input: {
   // HTML document, render it as a preview so the user still sees the
   // output. Skip when the text clearly looks like SEARCH/REPLACE output
   // (handled above) or when the LLM is just discussing HTML in prose.
-  if (processed.diffProposals.length > 0) return;
+  if (processed.diffProposals.length > 0) return result;
   const extraction = extractStandaloneHtml(rawText);
   if (!extraction) {
     console.info("[AgentHub] postProcess: HTML fallback skipped", {
@@ -1294,7 +1729,7 @@ async function postProcessStreamingAssistantMessage(input: {
       hasFence: /```/.test(rawText),
       hasDoctype: /<!doctype/i.test(rawText)
     });
-    return;
+    return result;
   }
   const { html: fallbackHtml, strippedText } = extraction;
   // Route the inline HTML through the same diff_card flow as a real
@@ -1329,6 +1764,7 @@ async function postProcessStreamingAssistantMessage(input: {
       htmlLength: fallbackHtml.length,
       stripped: strippedText !== rawText
     });
+    result.htmlFallbackCreated = true;
   } catch (error) {
     console.warn(
       "Failed to auto-create fallback HTML DiffProposal:",
@@ -1346,6 +1782,8 @@ async function postProcessStreamingAssistantMessage(input: {
       rawText.slice(0, 200)
     );
   }
+
+  return result;
 }
 
 /**

@@ -29,6 +29,7 @@ import { buildConversationContextForAgentRun, DEFAULT_CONTEXT_SAFETY_MARGIN_TOKE
 import { loadMainAgentConfig } from "./configService";
 import { DEFAULT_CONTEXT_WINDOW_TOKENS, DEFAULT_MAX_OUTPUT_TOKENS } from "../../shared/modelProvider";
 import { ThinkBlockParser } from "./thinkBlockParser";
+import type { AgentArtifactTarget } from "../../shared/agentExecution";
 
 const HTML_FILE_PATTERN = /\.(html?|htm)$/i;
 
@@ -58,6 +59,7 @@ export type StreamingRunInput = {
   userMessage: string;
   executionScope?: ProviderSessionExecutionScope;
   dispatchStepId?: string | null;
+  artifactTarget?: AgentArtifactTarget;
   maxIterations: number;
   resume?: boolean;
   /** When true, skip saving the user message (used by sub-agents that already saved it). */
@@ -214,6 +216,8 @@ export async function* runStreamingAgent(
           db
         )
       : undefined,
+    artifactTarget: input.artifactTarget,
+    executionMode: input.dispatchStepId ? "group_subagent" : "single_chat",
     resume: {
       enabled: Boolean(providerSessionId) && input.resume !== false,
       providerSessionId
@@ -226,6 +230,11 @@ export async function* runStreamingAgent(
   let status: "completed" | "failed" | "cancelled" = "completed";
   let errorMessage: string | undefined;
   let newProviderSessionId: string | undefined;
+  const artifactTarget = input.artifactTarget ?? {
+    workspaceId: input.workspaceId,
+    conversationId: input.conversationId,
+    dispatchStepId: input.dispatchStepId ?? undefined
+  };
 
   try {
     const thinkParser = new ThinkBlockParser();
@@ -279,12 +288,14 @@ export async function* runStreamingAgent(
             try {
               await createDiffProposal(
                 {
-                  workspaceId: input.workspaceId,
+                  workspaceId: artifactTarget.workspaceId,
                   agentId: input.agent.id,
-                  conversationId: input.conversationId,
+                  conversationId: artifactTarget.conversationId,
                   filePath: file.path,
                   unifiedDiff: file.unifiedDiff,
-                  isNewFile: file.status === "added"
+                  isNewFile: file.status === "added",
+                  dispatchRunId: artifactTarget.dispatchRunId,
+                  dispatchStepId: artifactTarget.dispatchStepId
                 },
                 db
               );
@@ -300,9 +311,9 @@ export async function* runStreamingAgent(
                   if (previewType) {
                     const previewArtifact = createArtifact(
                       {
-                        workspaceId: input.workspaceId,
+                        workspaceId: artifactTarget.workspaceId,
                         agentId: input.agent.id,
-                        conversationId: input.conversationId,
+                        conversationId: artifactTarget.conversationId,
                         type: previewType,
                         title: file.path,
                         content: newContent,
@@ -311,14 +322,16 @@ export async function* runStreamingAgent(
                       },
                       db
                     );
-                    attachArtifactPreviewToMessage(
-                      {
-                        messageId: assistantMessage.id,
-                        conversationId: input.conversationId,
-                        artifact: previewArtifact
-                      },
-                      db
-                    );
+                    if (artifactTarget.conversationId === input.conversationId) {
+                      attachArtifactPreviewToMessage(
+                        {
+                          messageId: assistantMessage.id,
+                          conversationId: input.conversationId,
+                          artifact: previewArtifact
+                        },
+                        db
+                      );
+                    }
                   }
                 }
               }
@@ -331,18 +344,20 @@ export async function* runStreamingAgent(
           }
         }
       } else if (event.type === "artifact.created") {
-        createMessageArtifact(
-          {
-            messageId: assistantMessage.id,
-            conversationId: input.conversationId,
-            type: "artifact_preview",
-            payload: {
-              ...event.payload,
-              messageId: assistantMessage.id
-            }
-          },
-          db
-        );
+        if (artifactTarget.conversationId === input.conversationId) {
+          createMessageArtifact(
+            {
+              messageId: assistantMessage.id,
+              conversationId: input.conversationId,
+              type: "artifact_preview",
+              payload: {
+                ...event.payload,
+                messageId: assistantMessage.id
+              }
+            },
+            db
+          );
+        }
       } else if (event.type === "tool.call.completed") {
         createMessageArtifact(
           {

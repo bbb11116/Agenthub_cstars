@@ -1,6 +1,8 @@
 import { randomUUID } from "node:crypto";
 import type {
   Artifact,
+  ArtifactLifecycleOrigin,
+  ArtifactMetadata,
   CreateArtifactInput,
   UpdateArtifactInput
 } from "../../../shared/artifact";
@@ -26,7 +28,7 @@ type ArtifactRow = {
   updated_at: string;
 };
 
-type ArtifactMetadata = {
+type ArtifactDbMetadata = Omit<ArtifactMetadata, "language" | "version" | "render"> & {
   language?: unknown;
   version?: unknown;
   render?: unknown;
@@ -52,6 +54,18 @@ function toVersion(value: unknown): number {
   return typeof value === "number" && Number.isInteger(value) && value > 0 ? value : 1;
 }
 
+const ARTIFACT_LIFECYCLE_ORIGINS: readonly ArtifactLifecycleOrigin[] = [
+  "final_output",
+  "intermediate",
+  "synthetic_wrapper",
+  "fallback_parse_dump",
+  "diff_preview"
+];
+
+function isArtifactLifecycleOrigin(value: unknown): value is ArtifactLifecycleOrigin {
+  return ARTIFACT_LIFECYCLE_ORIGINS.includes(value as ArtifactLifecycleOrigin);
+}
+
 function inferLegacyArtifactType(row: ArtifactRow, content: string): Artifact["type"] {
   const lowerFilePath = row.file_path?.toLowerCase() ?? "";
 
@@ -74,13 +88,31 @@ function toArtifact(row: ArtifactRow): Artifact {
   const content = toContentString(
     parseJsonField<unknown>(row.content, "", "artifacts.content")
   );
-  const metadata = parseJsonField<ArtifactMetadata>(row.metadata, {}, "artifacts.metadata");
+  const metadata = parseJsonField<ArtifactDbMetadata>(row.metadata, {}, "artifacts.metadata");
   const language = typeof metadata.language === "string" ? metadata.language : undefined;
   const version = toVersion(metadata.version);
   const render =
     metadata.render && typeof metadata.render === "object"
       ? (metadata.render as Artifact["render"])
       : undefined;
+  const lifecycleMetadata: ArtifactMetadata = {};
+
+  if (isArtifactLifecycleOrigin(metadata.origin)) {
+    lifecycleMetadata.origin = metadata.origin;
+  }
+  if (typeof metadata.official === "boolean") {
+    lifecycleMetadata.official = metadata.official;
+  }
+  if (typeof metadata.dispatchRunId === "string") {
+    lifecycleMetadata.dispatchRunId = metadata.dispatchRunId;
+  }
+  if (typeof metadata.dispatchStepId === "string") {
+    lifecycleMetadata.dispatchStepId = metadata.dispatchStepId;
+  }
+  if (typeof metadata.sourceArtifactId === "string") {
+    lifecycleMetadata.sourceArtifactId = metadata.sourceArtifactId;
+  }
+  const hasLifecycleMetadata = Object.keys(lifecycleMetadata).length > 0;
 
   return {
     id: row.id,
@@ -95,6 +127,14 @@ function toArtifact(row: ArtifactRow): Artifact {
     language,
     filePath: row.file_path ?? undefined,
     render,
+    metadata: hasLifecycleMetadata
+      ? {
+          ...lifecycleMetadata,
+          language,
+          version,
+          render
+        }
+      : undefined,
     version,
     createdAt: row.created_at
   };
@@ -116,6 +156,7 @@ export function createArtifact(
     language: input.language,
     filePath: input.filePath,
     render: input.render,
+    metadata: input.metadata,
     version: input.version ?? 1,
     createdAt: now
   };
@@ -157,6 +198,7 @@ export function createArtifact(
     filePath: artifact.filePath ?? null,
     content: stringifyJsonField(artifact.content),
     metadata: stringifyJsonField({
+      ...(artifact.metadata ?? {}),
       language: artifact.language,
       version: artifact.version,
       render: artifact.render
@@ -185,6 +227,24 @@ export function getArtifactsByConversation(
       "SELECT * FROM artifacts WHERE conversation_id = ? ORDER BY updated_at DESC"
     )
     .all(conversationId)
+    .map(toArtifact);
+}
+
+export function getArtifactsByConversationAgentSince(
+  conversationId: string,
+  agentId: string,
+  since: string,
+  db: AgentHubDatabase = getDatabase()
+): Artifact[] {
+  return db
+    .prepare<[string, string, string], ArtifactRow>(
+      `SELECT * FROM artifacts
+       WHERE conversation_id = ?
+         AND agent_id = ?
+         AND created_at >= ?
+       ORDER BY created_at ASC, rowid ASC`
+    )
+    .all(conversationId, agentId, since)
     .map(toArtifact);
 }
 
@@ -235,6 +295,7 @@ export function updateArtifact(
     filePath: next.filePath ?? null,
     content: stringifyJsonField(next.content),
     metadata: stringifyJsonField({
+      ...(next.metadata ?? {}),
       language: next.language,
       version: next.version,
       render: next.render

@@ -71,13 +71,13 @@ type AgentToolCall = {
 type CreateArtifactArgs = {
   title: string;
   content: string;
-  type: "html" | "document" | "presentation";
+  type: "html" | "markdown" | "document" | "presentation";
 };
 
 const CREATE_ARTIFACT_TOOL_DEFINITION: LLMToolDefinition = {
   name: "create_artifact",
   description: [
-    "Create an ephemeral HTML / Document / Presentation preview card in the current chat.",
+    "Create an ephemeral HTML / Markdown / Document / Presentation preview card in the current chat.",
     "The artifact is stored in the database only — it does NOT write to the workspace file system.",
     "Use this for drafts, outlines, formatted content the user wants to inspect, or visual deliverables.",
     "For code/text file modifications to the workspace, continue to emit SEARCH/REPLACE DiffProposal blocks; the user must Apply them before files are written."
@@ -92,13 +92,13 @@ const CREATE_ARTIFACT_TOOL_DEFINITION: LLMToolDefinition = {
       content: {
         type: "string",
         description:
-          "The artifact body. For html/document/presentation types, write semantic HTML; the renderer will display it in an iframe."
+          "The artifact body. For html/document/presentation types, write semantic HTML; for markdown, write Markdown."
       },
       type: {
         type: "string",
-        enum: ["html", "document", "presentation"],
+        enum: ["html", "markdown", "document", "presentation"],
         description:
-          "Artifact category. All three render via the HTML iframe pipeline (no external renderer required)."
+          "Artifact category. HTML/document/presentation render via the HTML iframe pipeline; markdown renders as Markdown."
       }
     },
     required: ["title", "content", "type"],
@@ -151,8 +151,8 @@ function parseCreateArtifactArgs(raw: unknown): CreateArtifactArgs {
   if (typeof content !== "string") {
     throw new Error("create_artifact requires content to be a string");
   }
-  if (type !== "html" && type !== "document" && type !== "presentation") {
-    throw new Error("create_artifact type must be one of: html, document, presentation");
+  if (type !== "html" && type !== "markdown" && type !== "document" && type !== "presentation") {
+    throw new Error("create_artifact type must be one of: html, markdown, document, presentation");
   }
   return { title, content, type };
 }
@@ -167,10 +167,11 @@ function buildWebToolSystemPrompt(
     toolPolicy.push(
       "Artifact policy:",
       "When the user asks for a preview, a draft, an outline, a slide deck, a formatted document, a demo, a mock-up, or any 'show me what it would look like' deliverable, you MUST use the create_artifact tool. Do NOT emit a SEARCH/REPLACE block for those requests.",
-      "create_artifact produces an HTML preview card directly in chat. Pass title (string), content (HTML string), and type (one of: html, document, presentation). The type value only shapes the preview; all three render via the HTML iframe pipeline.",
+      "create_artifact produces a preview card directly in chat. Pass title (string), content (HTML or Markdown string), and type (one of: html, markdown, document, presentation). For document/presentation, provide semantic HTML.",
+      "For PPT / slide deck / presentation HTML artifacts, create one single HTML document with all slides stacked vertically in source order. The AgentHub preview supports vertical scrolling only; do not add JavaScript navigation, onclick/onkeydown handlers, prev/next buttons, page indicators, keyboard shortcuts, swipe gestures, click regions, or other interactive slide controls.",
       "create_artifact stores the content in the database only — it does NOT modify the workspace. If the user wants a real file on disk, they will say so explicitly (e.g. 'save to repo', 'commit', 'create file X').",
       "SEARCH/REPLACE DiffProposal blocks are reserved for actual workspace file modifications the user wants persisted to disk. Do not use them as a substitute for create_artifact.",
-      "Never paste the full HTML / document body into plain text. Always call create_artifact so the user sees a preview card."
+      "Never paste the full HTML / Markdown / document body into plain text. Always call create_artifact so the user sees a preview card."
     );
   }
   if (nativeToolCalling) {
@@ -600,17 +601,28 @@ export class BuiltinAgentAdapter implements AgentAdapter {
 
     let artifact: Artifact;
     try {
-      const created = createArtifact({
+      const artifactTarget = input.artifactTarget ?? {
         workspaceId: input.workspaceId,
-        conversationId: input.conversationId,
+        conversationId: input.conversationId
+      };
+      const storedType = args.type === "markdown" ? "markdown" : "html";
+      const created = createArtifact({
+        workspaceId: artifactTarget.workspaceId,
+        conversationId: artifactTarget.conversationId,
         agentId: input.agentId,
-        type: "html",
+        type: storedType,
         title: args.title,
         content: args.content,
-        language: "html",
+        language: storedType,
+        metadata: {
+          origin: "final_output",
+          official: true,
+          dispatchRunId: artifactTarget.dispatchRunId,
+          dispatchStepId: artifactTarget.dispatchStepId
+        },
         render: {
           status: "none",
-          mode: "html_iframe",
+          mode: storedType === "markdown" ? "markdown" : "html_iframe",
           source: "content",
           assets: []
         }
@@ -643,7 +655,7 @@ export class BuiltinAgentAdapter implements AgentAdapter {
           {
             artifactId: artifact.id,
             title: artifact.title,
-            type: "html",
+            type: artifact.type,
             filePath: artifact.filePath,
             language: artifact.language,
             sizeBytes: Buffer.byteLength(artifact.content, "utf8"),

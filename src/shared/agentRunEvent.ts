@@ -13,6 +13,7 @@
  */
 
 import type { ArtifactPreviewPayload, ArtifactRenderChangedPayload } from "./artifact";
+import type { AgentArtifactTarget, AgentExecutionMode } from "./agentExecution";
 import type { RuntimeProvider } from "./runtime";
 
 export type AgentRunEventType =
@@ -193,6 +194,8 @@ export type AgentProviderRunInput = {
     role: "user" | "assistant" | "system" | "agent";
     content: string;
   }>;
+  artifactTarget?: AgentArtifactTarget;
+  executionMode?: AgentExecutionMode;
   toolPermissions?: string[];
   /**
    * If true, the adapter may attempt to resume a prior provider session.

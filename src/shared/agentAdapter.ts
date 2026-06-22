@@ -1,6 +1,6 @@
 import type { RuntimeProvider } from "./runtime";
 import type { ClaudeCodeConfig } from "./domain";
-import type { AgentRunOptions } from "./agentExecution";
+import type { AgentArtifactTarget, AgentRunOptions } from "./agentExecution";
 
 export type AgentRunInput = {
   workspaceId: string;
@@ -18,6 +18,7 @@ export type AgentRunInput = {
   toolPermissions: string[];
   claudeCodeConfig?: ClaudeCodeConfig;
   env?: Record<string, string>;
+  artifactTarget?: AgentArtifactTarget;
   runOptions: AgentRunOptions;
   resume: {
     enabled: boolean;

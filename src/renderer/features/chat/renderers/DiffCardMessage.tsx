@@ -4,7 +4,7 @@ import type {
   DiffCardContent,
   DiffProposal
 } from "../../../../shared/diff";
-import { DiffViewer } from "../../diff/DiffViewer";
+import { DiffViewer, LARGE_DIFF_CHAR_LIMIT } from "../../diff/DiffViewer";
 
 type DiffCardStatus = "loading" | "ready" | "error";
 type DiffActionStatus = "idle" | "applying" | "rejecting";
@@ -74,6 +74,7 @@ export function DiffCardMessage({ content }: DiffCardMessageProps) {
   const [error, setError] = useState<string | null>(null);
   const [actionNotice, setActionNotice] = useState<string | null>(null);
   const [actionStatus, setActionStatus] = useState<DiffActionStatus>("idle");
+  const [expanded, setExpanded] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -87,6 +88,7 @@ export function DiffCardMessage({ content }: DiffCardMessageProps) {
 
       setStatus("loading");
       setError(null);
+      setExpanded(false);
 
       try {
         const loadedProposal = await window.agenthub.diff.get(content.diffProposalId);
@@ -215,6 +217,42 @@ export function DiffCardMessage({ content }: DiffCardMessageProps) {
 
   const isPending = proposal.status === "pending";
   const isBusy = actionStatus !== "idle";
+  const isLargeDiff = proposal.diffContent.length > LARGE_DIFF_CHAR_LIMIT;
+  const showCompact = isLargeDiff && !expanded;
+
+  if (showCompact) {
+    return (
+      <article className="diff-card diff-card-message">
+        <div className="diff-card-message-line">
+          <span className="diff-card-message-title">变更提案</span>
+          <span className="diff-card-message-meta">
+            {proposal.filePath} · {formatStatus(proposal.status)}
+            {content.summary ? ` · ${content.summary}` : ""} · Large diff
+          </span>
+        </div>
+        <div className="diff-card-actions">
+          <button type="button" onClick={() => setExpanded(true)}>
+            Expand
+          </button>
+          <button
+            disabled={!isPending || isBusy}
+            type="button"
+            onClick={() => void handleApply()}
+          >
+            {actionStatus === "applying" ? "应用中" : "应用 Diff"}
+          </button>
+          <button
+            disabled={!isPending || isBusy}
+            type="button"
+            onClick={() => void handleReject()}
+          >
+            {actionStatus === "rejecting" ? "拒绝中" : "拒绝"}
+          </button>
+        </div>
+        {actionNotice ? <p className="diff-card-notice">{actionNotice}</p> : null}
+      </article>
+    );
+  }
 
   return (
     <article className="diff-card">
@@ -231,6 +269,12 @@ export function DiffCardMessage({ content }: DiffCardMessageProps) {
         diffContent={proposal.diffContent}
         filePath={proposal.filePath}
         label={`${proposal.filePath} 的 Diff 提案`}
+        defaultExpanded={isLargeDiff ? expanded : undefined}
+        onExpandedChange={(next) => {
+          if (!next) {
+            setExpanded(false);
+          }
+        }}
       />
 
       <div className="diff-card-actions">

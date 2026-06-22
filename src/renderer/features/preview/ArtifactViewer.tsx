@@ -4,11 +4,11 @@ import { HtmlPreview } from "./HtmlPreview";
 import { MarkdownPreview } from "./MarkdownPreview";
 import { ScaledHtmlFrame } from "./ScaledHtmlFrame";
 import { ScaledPdfFrame } from "./ScaledPdfFrame";
-import { ZoomablePreview } from "./ZoomablePreview";
 
 type ArtifactViewerProps = {
   artifact: Artifact;
   compact?: boolean;
+  scaled?: boolean;
   contentOverride?: string;
   onArtifactUpdated?: (artifact: Artifact) => void;
   onOpenDiff?: () => void;
@@ -64,6 +64,7 @@ function getPrimaryAssetUrl(artifact: Artifact): string | null {
 export function ArtifactViewer({
   artifact,
   compact = false,
+  scaled = false,
   contentOverride,
   onArtifactUpdated,
   onOpenDiff
@@ -167,21 +168,21 @@ export function ArtifactViewer({
           </button>
         </div>
       ) : (
-        <ZoomablePreview className={compact ? "compact" : ""}>
-          <div className={compact ? "preview-body compact" : "preview-body"}>
-            {artifact.type === "html" ? (
-              artifact.filePath && compact ? (
+        <div className={compact ? "preview-body compact" : "preview-body"}>
+          {artifact.type === "html" ? (
+            scaled ? (
+              <div className="scaled-html-frame-centerer">
                 <ScaledHtmlFrame content={content} title={artifact.title} />
-              ) : (
-                <HtmlPreview content={content} title={artifact.title} />
-              )
-            ) : artifact.type === "markdown" ? (
-              <MarkdownPreview content={visibleContent} />
+              </div>
             ) : (
-              <CodePreview content={visibleContent} />
-            )}
-          </div>
-        </ZoomablePreview>
+              <HtmlPreview content={content} title={artifact.title} />
+            )
+          ) : artifact.type === "markdown" ? (
+            <MarkdownPreview content={visibleContent} />
+          ) : (
+            <CodePreview content={visibleContent} />
+          )}
+        </div>
       )}
 
       {isLarge && artifact.type !== "html" && !compact ? (

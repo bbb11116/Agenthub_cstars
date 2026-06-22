@@ -112,6 +112,15 @@ describe("groupExecutionService", () => {
     expect(firstReview.review.nextAssignments[0].dependsOn).toEqual([
       "assignment-1"
     ]);
+    expect(firstReview.review.nextAssignments[0].instruction).toContain(
+      "原始子任务:\n实现修改并运行测试"
+    );
+    expect(firstReview.review.nextAssignments[0].instruction).toContain(
+      "上一轮建议修复动作:\n只运行测试"
+    );
+    expect(firstReview.review.nextAssignments[0].instruction).toContain(
+      "不得改换交付物类型"
+    );
 
     const finalReview = reviewAcceptanceCriteria({
       criteria,
@@ -121,6 +130,36 @@ describe("groupExecutionService", () => {
     });
     expect(finalReview.review.decision).toBe("partial");
     expect(finalReview.review.nextAssignments).toEqual([]);
+  });
+
+  it("does not create a new DAG repair assignment after local deliverable repair is exhausted", () => {
+    const invalidDeliverableResult = parseSubAgentResult({
+      agentId: "agent-1",
+      targetCriteria: ["criterion-code", "criterion-test"],
+      rawText: JSON.stringify({
+        status: "partial",
+        summary: "交付物仍无效",
+        completedCriteria: [],
+        unresolvedCriteria: ["criterion-code", "criterion-test"],
+        filesRead: [],
+        assumptions: [],
+        risks: ["Markdown 报告章节不完整"]
+      }),
+      runMetadata: {
+        deliverableValidationFailed: true,
+        localRepairExhausted: true
+      }
+    });
+
+    const reviewed = reviewAcceptanceCriteria({
+      criteria,
+      results: [invalidDeliverableResult],
+      assignments,
+      roundIndex: 0
+    });
+
+    expect(reviewed.review.decision).toBe("need_user_input");
+    expect(reviewed.review.nextAssignments).toEqual([]);
   });
 
   it("creates a user-facing fallback summary without internal audit details", () => {

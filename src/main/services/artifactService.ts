@@ -1,6 +1,8 @@
 import path from "node:path";
 import type {
   Artifact,
+  ArtifactLifecycleOrigin,
+  ArtifactMetadata,
   ArtifactType,
   CreateArtifactInput,
   PreviewArtifactInput
@@ -91,6 +93,44 @@ function normalizeVersion(value: unknown): number {
   }
 
   return value;
+}
+
+const ARTIFACT_LIFECYCLE_ORIGINS: readonly ArtifactLifecycleOrigin[] = [
+  "final_output",
+  "intermediate",
+  "synthetic_wrapper",
+  "fallback_parse_dump",
+  "diff_preview"
+];
+
+function isArtifactLifecycleOrigin(value: unknown): value is ArtifactLifecycleOrigin {
+  return ARTIFACT_LIFECYCLE_ORIGINS.includes(value as ArtifactLifecycleOrigin);
+}
+
+function normalizeArtifactMetadata(value: unknown): ArtifactMetadata | undefined {
+  if (!isRecord(value)) {
+    return undefined;
+  }
+
+  const metadata: ArtifactMetadata = {};
+
+  if (isArtifactLifecycleOrigin(value.origin)) {
+    metadata.origin = value.origin;
+  }
+  if (typeof value.official === "boolean") {
+    metadata.official = value.official;
+  }
+  if (typeof value.dispatchRunId === "string" && value.dispatchRunId.trim()) {
+    metadata.dispatchRunId = value.dispatchRunId.trim();
+  }
+  if (typeof value.dispatchStepId === "string" && value.dispatchStepId.trim()) {
+    metadata.dispatchStepId = value.dispatchStepId.trim();
+  }
+  if (typeof value.sourceArtifactId === "string" && value.sourceArtifactId.trim()) {
+    metadata.sourceArtifactId = value.sourceArtifactId.trim();
+  }
+
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
 }
 
 function toArtifactServiceError(error: unknown, fallbackMessage: string): ArtifactServiceError {
@@ -247,6 +287,7 @@ function normalizeCreateArtifactInput(
       resolveExecutionWorkspaceForConversation(conversation.id, agent.id, db).rootPath,
       input.filePath
     ),
+    metadata: normalizeArtifactMetadata(input.metadata),
     version: normalizeVersion(input.version)
   };
 }

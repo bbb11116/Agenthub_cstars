@@ -1,11 +1,13 @@
 import { useMemo, useState } from "react";
 
-const LARGE_DIFF_CHAR_LIMIT = 12_000;
+export const LARGE_DIFF_CHAR_LIMIT = 12_000;
 
 type DiffViewerProps = {
   diffContent: string;
   filePath: string;
   label?: string;
+  defaultExpanded?: boolean;
+  onExpandedChange?: (expanded: boolean) => void;
 };
 
 function getDiffLineClassName(line: string): string {
@@ -28,10 +30,22 @@ function getDiffLineClassName(line: string): string {
   return "diff-line";
 }
 
-export function DiffViewer({ diffContent, filePath, label }: DiffViewerProps) {
+export function DiffViewer({
+  diffContent,
+  filePath,
+  label,
+  defaultExpanded,
+  onExpandedChange
+}: DiffViewerProps) {
   const isLargeDiff = diffContent.length > LARGE_DIFF_CHAR_LIMIT;
-  const [expanded, setExpanded] = useState(!isLargeDiff);
+  const [expanded, setExpanded] = useState(defaultExpanded ?? !isLargeDiff);
   const lines = useMemo(() => diffContent.split("\n"), [diffContent]);
+
+  const handleToggle = (): void => {
+    const next = !expanded;
+    setExpanded(next);
+    onExpandedChange?.(next);
+  };
 
   if (diffContent.trim().length === 0) {
     return (
@@ -50,7 +64,7 @@ export function DiffViewer({ diffContent, filePath, label }: DiffViewerProps) {
           <small>{isLargeDiff ? "Large diff" : "Unified diff"}</small>
         </div>
         {isLargeDiff ? (
-          <button type="button" onClick={() => setExpanded((current) => !current)}>
+          <button type="button" onClick={handleToggle}>
             {expanded ? "Collapse" : "Expand"}
           </button>
         ) : null}

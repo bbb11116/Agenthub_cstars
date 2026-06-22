@@ -217,7 +217,7 @@ export function ArtifactPreviewCard({ artifact }: ArtifactRendererProps) {
         {loadError ? (
           <p className="artifact-preview-error">{loadError}</p>
         ) : previewArtifact ? (
-          <ArtifactViewer artifact={previewArtifact} compact onArtifactUpdated={setPreviewArtifact} />
+          <ArtifactViewer artifact={previewArtifact} compact scaled onArtifactUpdated={setPreviewArtifact} />
         ) : (
           <div className="preview-empty-state">
             <span className="placeholder-title">Loading</span>

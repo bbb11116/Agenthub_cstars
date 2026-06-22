@@ -501,6 +501,8 @@ describe("BuiltinAgentAdapter", () => {
     }
 
     const firstCallArgs = callLLMWithToolSupport.mock.calls[0];
+    expect(firstCallArgs[1]).toContain("vertical scrolling only");
+    expect(firstCallArgs[1]).toContain("do not add JavaScript navigation");
     const passedToolNames = (firstCallArgs[3] as Array<{ name: string }>).map((tool) => tool.name);
     expect(passedToolNames).toContain("create_artifact");
 
@@ -794,7 +796,7 @@ describe("BuiltinAgentAdapter", () => {
           .toolResults[0]?.ok === false)
     ) as { type: "structured_result"; result: { toolResults: Array<{ ok: boolean; errorMessage?: string }> } };
     expect(errorResult).toBeDefined();
-    expect(errorResult.result.toolResults[0].errorMessage).toMatch(/html, document, presentation/);
+    expect(errorResult.result.toolResults[0].errorMessage).toMatch(/html, markdown, document, presentation/);
   });
 
   it("rejects create_artifact with missing or non-string content", async () => {

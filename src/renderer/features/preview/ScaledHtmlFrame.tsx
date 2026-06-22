@@ -9,6 +9,7 @@ type ScaledHtmlFrameProps = {
 const NATURAL_WIDTH = 1920;
 const NATURAL_HEIGHT = 1080;
 
+
 // Force a clean white canvas and constrain content to 100% width so the
 // scaled iframe preview always looks like a normal slide deck, regardless
 // of what the LLM put in the body (it may set a dark background, fixed

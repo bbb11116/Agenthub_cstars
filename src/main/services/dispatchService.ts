@@ -7,7 +7,7 @@ import type {
   RunAgentStreamEvent,
   Workspace
 } from "../../shared/domain";
-import type { Artifact } from "../../shared/artifact";
+import type { Artifact, ArtifactLifecycleOrigin, ArtifactMetadata } from "../../shared/artifact";
 import {
   MAX_DISPATCH_STEPS,
   type DispatchMode,
@@ -49,7 +49,6 @@ import { getDatabase, type AgentHubDatabase } from "../db";
 import { getAgentById } from "../db/repositories/agentRepo";
 import {
   getConversationById,
-  getFirstConversationByAgent,
   createConversation
 } from "../db/repositories/conversationRepo";
 import { getWorkspaceById } from "../db/repositories/workspaceRepo";
@@ -74,6 +73,11 @@ import {
   updateStepInputContextSnapshot
 } from "../db/repositories/dispatchStepRepo";
 import { getAgentRunByDispatchStep } from "../db/repositories/agentRunRepo";
+import {
+  deleteArtifact,
+  getArtifactsByConversationAgentSince,
+  updateArtifact as updateArtifactRow
+} from "../db/repositories/artifactRepo";
 import { createGroupRunEvent } from "../db/repositories/groupRunEventRepo";
 import { getActiveMembers } from "../db/repositories/conversationMemberRepo";
 import {
@@ -96,7 +100,11 @@ import { resolveExecutionWorkspaceForGroup } from "./workspaceContextResolver";
 import { buildGroupSubAgentMemoryContext } from "./memoryContextService";
 import { updateExperiencesAfterGroupDispatch } from "./agentProjectExperienceService";
 import { createMessage as insertMessage } from "./messageService";
-import { createArtifact } from "./artifactService";
+import {
+  attachArtifactPreviewToMessage,
+  createArtifact,
+  getArtifact
+} from "./artifactService";
 import { listByGroup as listExperiencesByGroup } from "../db/repositories/agentProjectExperienceRepo";
 import {
   buildExecutionBatches,
@@ -117,6 +125,7 @@ class DispatchError extends Error {
 export type DispatchStreamHandler = (event: DispatchRunStreamEvent) => void;
 
 const MAX_SUB_AGENT_OUTPUT_CONTINUATIONS = 3;
+const MAX_SUB_AGENT_DELIVERABLE_REPAIRS = 1;
 const LONG_DELIVERABLE_ARTIFACT_THRESHOLD = 1_500;
 const OUTPUT_TRUNCATION_PATTERN =
   /truncated|timed out|max_completion_tokens|max_tokens|length|stream idle/i;
@@ -485,6 +494,404 @@ function buildSubAgentContinuationPrompt(input: {
   ].join("\n");
 }
 
+type RequiredDeliverableKind = "presentation" | "html" | "markdown";
+
+type DeliverableValidationResult =
+  | { valid: true; requirement: RequiredDeliverableKind | null }
+  | { valid: false; requirement: RequiredDeliverableKind; reason: string };
+
+function inferRequiredDeliverableKind(input: {
+  step: DispatchStep;
+  criteria: AcceptanceCriterion[];
+}): RequiredDeliverableKind | null {
+  const stepKind = inferDeliverableKindFromText(input.step.instruction);
+  if (stepKind) {
+    return stepKind;
+  }
+
+  return inferDeliverableKindFromText(
+    [
+      input.step.instruction,
+      ...input.criteria.map((criterion) => criterion.description)
+    ].join("\n")
+  );
+}
+
+function inferDeliverableKindFromText(text: string): RequiredDeliverableKind | null {
+  const explicitMarkdown = /markdown|\.md\b|\bmd\b/i.test(text);
+  const requiredMarkdownSections = getRequiredMarkdownSections(text);
+  const explicitReportArtifact =
+    /(?:产物|artifact|可预览|预览|交付).{0,40}(?:报告|摘要|总结|汇总|调研|report|summary)/i.test(text) ||
+    /(?:报告|摘要|总结|汇总|调研|report|summary).{0,40}(?:产物|artifact|可预览|预览|交付)/i.test(text);
+  const markdownKind = explicitMarkdown || requiredMarkdownSections.length >= 2 || explicitReportArtifact;
+  const presentationKind =
+    /pptx?|slide\s*deck|slides?|presentation|keynote|演示文稿|演示稿|幻灯片|PPT|汇报/i.test(text);
+
+  if (markdownKind && !presentationKind) {
+    return "markdown";
+  }
+
+  if (presentationKind) {
+    return "presentation";
+  }
+
+  if (/html|网页|页面|落地页|介绍页|landing\s*page|web\s*page/i.test(text)) {
+    return "html";
+  }
+
+  if (markdownKind) {
+    return "markdown";
+  }
+
+  return null;
+}
+
+function getDeliverableTaskText(input: {
+  step: DispatchStep;
+  criteria: AcceptanceCriterion[];
+}): string {
+  return [
+    input.step.instruction,
+    ...input.criteria.map((criterion) => criterion.description)
+  ].join("\n");
+}
+
+function isPlaceholderDeliverableContent(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ").trim();
+  if (compact.length === 0) {
+    return true;
+  }
+
+  if (compact.length > 320) {
+    return false;
+  }
+
+  return /(?:已创建|创建完成|成功创建|已生成|生成完成|继续生成|正在生成|让我创建|现在生成|现在让我创建|空 artifact|空的 artifact|尚未产出|尚未生成|未生成|artifact 已成功创建|previewArtifact|PPT 已创建|HTML 已创建|报告已创建|created|continue generating|placeholder)/i.test(compact);
+}
+
+function isRuntimeContractWrapperContent(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ").trim();
+  if (!compact) {
+    return false;
+  }
+
+  return (
+    /(?:The user asked|this round I am only asked|tool has returned|No further tool calls|required|runtime contract|completion result)/i.test(compact) &&
+    /(?:create_artifact|artifactIds|artifactId|outputs|evidence|policy_check|create_artifact_response)/i.test(compact)
+  );
+}
+
+function isProcessOnlyDeliverableContent(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ").trim();
+  if (!compact || compact.length > 220) {
+    return false;
+  }
+
+  return /^(?:let me|i(?:'ll| will| am going to)|getting|checking|fetching|searching|now I|okay|sure|好的|我来|我将|正在|继续|先查|先获取|让我)/i.test(compact);
+}
+
+function isLowValueSyntheticContent(content: string): boolean {
+  return (
+    isPlaceholderDeliverableContent(content) ||
+    isRuntimeContractWrapperContent(content) ||
+    isProcessOnlyDeliverableContent(content)
+  );
+}
+
+function hasMarkdownDeliverableStructure(content: string): boolean {
+  const trimmed = content.trim();
+  const lines = trimmed.split(/\r?\n/).map((line) => line.trim());
+  const headingCount = lines.filter((line) => /^#{1,6}\s+\S/.test(line)).length;
+  const listCount = lines.filter((line) => /^[-*+]\s+\S/.test(line) || /^\d+\.\s+\S/.test(line)).length;
+  const tableLike = lines.some((line) => /^\|.*\|$/.test(line));
+
+  return headingCount > 0 || listCount >= 2 || tableLike;
+}
+
+const COMMON_MARKDOWN_REPORT_SECTIONS = [
+  "执行摘要",
+  "定位差异",
+  "功能矩阵",
+  "优劣势分析",
+  "场景适配",
+  "选型建议",
+  "风险与趋势"
+];
+
+function getRequiredMarkdownSections(taskText: string): string[] {
+  return COMMON_MARKDOWN_REPORT_SECTIONS.filter((section) => taskText.includes(section));
+}
+
+function getRequiredMarkdownLength(taskText: string): number {
+  const explicit = taskText.match(/(?:≥|>=|不少于|至少)\s*([0-9][0-9,]*)\s*(?:字符|字|chars?|characters?)/i);
+  if (explicit?.[1]) {
+    return Number.parseInt(explicit[1].replace(/,/g, ""), 10);
+  }
+
+  if (/竞品分析|调研报告|研究报告|competitive analysis/i.test(taskText)) {
+    return 1_500;
+  }
+
+  return 40;
+}
+
+function hasSubstantialMarkdownContent(artifact: Artifact, taskText: string): boolean {
+  if (artifact.type !== "markdown") {
+    return false;
+  }
+
+  const content = artifact.content.trim();
+  if (
+    content.length < getRequiredMarkdownLength(taskText) ||
+    isLowValueSyntheticContent(content) ||
+    !hasMarkdownDeliverableStructure(content)
+  ) {
+    return false;
+  }
+
+  const requiredSections = getRequiredMarkdownSections(taskText);
+  return requiredSections.every((section) => content.includes(section));
+}
+
+function shouldPersistParseFailureAsArtifact(input: {
+  content: string;
+  step: DispatchStep;
+  criteria: AcceptanceCriterion[];
+}): boolean {
+  const content = input.content.trim();
+  if (!content || isLowValueSyntheticContent(content)) {
+    return false;
+  }
+
+  const taskText = [
+    input.step.instruction,
+    ...input.criteria.map((criterion) => criterion.description)
+  ].join("\n");
+  const asksForMarkdownLikeDeliverable =
+    /markdown|md|报告|摘要|总结|汇总|调研|分析|research|report|summary/i.test(taskText);
+
+  return (
+    content.length >= 500 ||
+    hasMarkdownDeliverableStructure(content) ||
+    (asksForMarkdownLikeDeliverable && content.length >= 180)
+  );
+}
+
+function hasSubstantialHtmlContent(artifact: Artifact): boolean {
+  if (artifact.type !== "html") {
+    return false;
+  }
+
+  const content = artifact.content.trim();
+  return (
+    content.length >= 300 &&
+    /<!doctype|<html[\s>]|<body[\s>]|<main[\s>]|<section[\s>]/i.test(content) &&
+    !isLowValueSyntheticContent(content)
+  );
+}
+
+function hasUnsupportedSlideNavigation(content: string): boolean {
+  const compact = content.replace(/\s+/g, " ");
+  return [
+    /<button\b/i,
+    /\bon(?:click|keydown|keyup)\s*=/i,
+    /addEventListener\s*\(\s*["'](?:click|keydown|keyup)["']/i,
+    /\b(?:ArrowLeft|ArrowRight|KeyboardEvent|event\.key|e\.key)\b/i,
+    /(?:class|id)\s*=\s*["'][^"']*(?:prev|previous|next|pagination|page-indicator|slide-nav|nav-button|pager|carousel|controls)[^"']*["']/i,
+    /function\s+(?:next|prev|previous)Slide\b/i,
+    /\b(?:nextSlide|prevSlide|previousSlide|goToSlide|showSlide)\s*\(/i
+  ].some((pattern) => pattern.test(compact));
+}
+
+function hasSubstantialPresentationContent(artifact: Artifact): boolean {
+  const content = artifact.content.trim();
+  if (isLowValueSyntheticContent(content)) {
+    return false;
+  }
+
+  if (artifact.type === "presentation" || artifact.type === "pdf") {
+    return content.length >= 300 || Boolean(artifact.filePath);
+  }
+
+  return (
+    artifact.type === "html" &&
+    content.length >= 300 &&
+    /<!doctype|<html[\s>]/i.test(content) &&
+    !hasUnsupportedSlideNavigation(content) &&
+    /slide|deck|ppt|presentation|演示|幻灯片|封面|目录/i.test(content)
+  );
+}
+
+function validateRequiredDeliverableArtifacts(input: {
+  result: SubAgentResult;
+  step: DispatchStep;
+  criteria: AcceptanceCriterion[];
+  db: AgentHubDatabase;
+}): DeliverableValidationResult {
+  const taskText = getDeliverableTaskText({
+    step: input.step,
+    criteria: input.criteria
+  });
+  const requirement = inferRequiredDeliverableKind({
+    step: input.step,
+    criteria: input.criteria
+  });
+
+  if (!requirement || input.result.status !== "completed") {
+    return { valid: true, requirement };
+  }
+
+  const artifacts = getReferencedArtifacts(input.result, input.db);
+  if (artifacts.length === 0) {
+    return {
+      valid: false,
+      requirement,
+      reason: requirement === "presentation"
+        ? "任务要求生成 PPT/演示稿，但 SubAgentResult 没有引用任何真实产物。"
+        : requirement === "html"
+          ? "任务要求生成 HTML 页面，但 SubAgentResult 没有引用任何真实产物。"
+          : "任务要求生成 Markdown 报告/摘要，但 SubAgentResult 没有引用任何真实产物。"
+    };
+  }
+
+  const hasValidArtifact = artifacts.some((artifact) =>
+    requirement === "presentation"
+      ? hasSubstantialPresentationContent(artifact)
+      : requirement === "html"
+        ? hasSubstantialHtmlContent(artifact)
+        : hasSubstantialMarkdownContent(artifact, taskText)
+  );
+
+  if (hasValidArtifact) {
+    return { valid: true, requirement };
+  }
+
+  const artifactSummary = artifacts
+    .map((artifact) => `${artifact.title}(${artifact.type}, ${artifact.content.trim().length} chars)`)
+    .join("; ");
+  const hasUnsupportedNavigation = requirement === "presentation" &&
+    artifacts.some((artifact) =>
+      artifact.type === "html" && hasUnsupportedSlideNavigation(artifact.content)
+    );
+
+  return {
+    valid: false,
+    requirement,
+    reason: requirement === "presentation"
+      ? hasUnsupportedNavigation
+        ? `任务要求生成 PPT/演示稿，但引用的 HTML 演示稿包含平台不支持的左右/按钮/键盘翻页控件；必须改为纵向堆叠、上下滚动：${artifactSummary}`
+        : `任务要求生成 PPT/演示稿，但引用的产物不是有效演示稿：${artifactSummary}`
+      : requirement === "html"
+        ? `任务要求生成 HTML 页面，但引用的产物不是有效 HTML：${artifactSummary}`
+        : `任务要求生成 Markdown 报告/摘要，但引用的产物不是有效 Markdown 交付物（类型、章节或长度不满足要求）：${artifactSummary}`
+  };
+}
+
+function buildSubAgentDeliverableRepairPrompt(input: {
+  step: DispatchStep;
+  criteria: AcceptanceCriterion[];
+  previousResult: SubAgentResult;
+  validation: Extract<DeliverableValidationResult, { valid: false }>;
+}): string {
+  const requiredTypeText =
+    input.validation.requirement === "presentation"
+      ? "PPT / 演示稿"
+      : input.validation.requirement === "markdown"
+        ? "Markdown 报告/摘要"
+      : "HTML 页面";
+  const artifactInstruction =
+    input.validation.requirement === "presentation"
+      ? [
+          "必须实际创建一个非空、可预览的演示稿产物。",
+          "优先使用 create_artifact 创建 type=html 的单文件 HTML slide deck；也可以创建 type=presentation 的真实演示稿产物。",
+          "HTML slide deck 内容必须包含完整 <!doctype html>/<html> 文档、多个 slide/section、封面、目录和任务要求的核心内容。",
+          "HTML slide deck 必须按页面顺序纵向堆叠，用户只能通过上下滚动预览；禁止 JavaScript 翻页、onclick/onkeydown、prev/next 按钮、页码控制器、键盘左右箭头、滑动或点击翻页交互。"
+        ]
+      : input.validation.requirement === "markdown"
+        ? [
+            "必须实际创建一个非空、可预览的 Markdown 报告/摘要产物。",
+            "使用 create_artifact 创建 type=markdown 的 Markdown 产物，不能创建 HTML 代替。",
+            "如果原任务列出了章节标题，Markdown 正文必须逐一包含这些章节，并在每个章节下写出实质内容。",
+            "如果原任务没有指定长度，报告类正文建议至少 3000 字符，避免只给大纲或幻灯片式短句。"
+          ]
+      : [
+          "必须实际创建一个非空、可预览的 HTML 页面产物。",
+          "使用 create_artifact 创建 type=html 的单文件 HTML 页面。",
+          "HTML 内容必须包含完整 <!doctype html>/<html> 文档、结构化页面内容和基本样式。"
+        ];
+
+  return [
+    "上一轮 SubAgentResult JSON 可以解析，但交付物无效，不能验收。",
+    `无效原因: ${input.validation.reason}`,
+    "",
+    `原任务: ${input.step.instruction}`,
+    input.criteria.length > 0
+      ? `验收项: ${input.criteria.map((criterion) => `${criterion.id}: ${criterion.description}`).join(" | ")}`
+      : `验收项: ${input.step.targetCriteria.join(", ") || "无"}`,
+    `上一轮错误结果摘要: ${input.previousResult.summary || "无"}`,
+    `上一轮错误 artifactIds: ${(input.previousResult.artifactIds ?? []).join(", ") || "无"}`,
+    "",
+    `现在必须重新生成真实的 ${requiredTypeText}。`,
+    ...artifactInstruction,
+    "禁止只返回“已创建/继续生成/正在生成”等声明性文字。",
+    "禁止引用上一轮的短 markdown 包装产物作为完成证据。",
+    "完成后只返回合法 SubAgentResult JSON；artifactIds、outputs、evidence 必须引用刚创建的真实产物 ID，outputs.type 必须匹配真实产物类型。"
+  ].join("\n");
+}
+
+function markInvalidDeliverableResult(input: {
+  result: SubAgentResult;
+  step: DispatchStep;
+  validation: Extract<DeliverableValidationResult, { valid: false }>;
+}): SubAgentResult {
+  const unresolvedCriteria = [
+    ...new Set([
+      ...input.step.targetCriteria,
+      ...(input.result.unresolvedCriteria ?? [])
+    ])
+  ];
+
+  return {
+    ...input.result,
+    status: "partial",
+    summary: `${input.result.summary || "子 Agent 未生成有效交付物"}（交付物无效：${input.validation.reason}）`,
+    completedCriteria: [],
+    unresolvedCriteria,
+    artifactIds: undefined,
+    outputs: undefined,
+    evidence: [],
+    risks: [...(input.result.risks ?? []), input.validation.reason],
+    nextSuggestedTask:
+      input.validation.requirement === "presentation"
+        ? "重新生成包含真实内容的 HTML/PPT 演示稿产物。"
+        : input.validation.requirement === "html"
+          ? "重新生成包含真实内容的 HTML 页面产物。"
+          : "重新生成章节齐全、内容充实的 Markdown 报告/摘要产物。",
+    metadata: {
+      ...(input.result.metadata ?? {}),
+      deliverableValidationFailed: true,
+      localRepairExhausted: true,
+      invalidArtifactIds: input.result.artifactIds
+    }
+  };
+}
+
+function demoteInvalidDeliverableArtifacts(
+  result: SubAgentResult,
+  db: AgentHubDatabase
+): void {
+  for (const artifact of getReferencedArtifacts(result, db)) {
+    withArtifactLifecycle(
+      artifact,
+      {
+        origin: "intermediate",
+        official: false
+      },
+      db
+    );
+  }
+}
+
 function createSubAgentMarkdownArtifact(
   input: {
     workspaceId: string;
@@ -494,6 +901,8 @@ function createSubAgentMarkdownArtifact(
     step: DispatchStep;
     content: string;
     titleSuffix: string;
+    origin: ArtifactLifecycleOrigin;
+    official: boolean;
   },
   db: AgentHubDatabase
 ): Artifact {
@@ -505,7 +914,13 @@ function createSubAgentMarkdownArtifact(
       type: "markdown",
       title: `${input.agentName} - Step ${input.step.stepIndex + 1} ${input.titleSuffix}`,
       content: input.content,
-      language: "markdown"
+      language: "markdown",
+      metadata: {
+        origin: input.origin,
+        official: input.official,
+        dispatchRunId: input.step.dispatchRunId,
+        dispatchStepId: input.step.id
+      }
     },
     db
   );
@@ -571,7 +986,9 @@ function maybeMoveLongDeliverableToArtifact(
       agentName: input.agentName,
       step: input.step,
       content: deliverable,
-      titleSuffix: "Deliverable"
+      titleSuffix: "Deliverable",
+      origin: "final_output",
+      official: true
     },
     db
   );
@@ -586,6 +1003,554 @@ function maybeMoveLongDeliverableToArtifact(
     ),
     artifacts: [artifact]
   };
+}
+
+function collectSubAgentArtifactIds(
+  result: SubAgentResult,
+  includeEvidence: boolean
+): string[] {
+  const ids = new Set<string>();
+
+  for (const id of result.artifactIds ?? []) {
+    ids.add(id);
+  }
+
+  for (const output of result.outputs ?? []) {
+    if (output.artifactId) {
+      ids.add(output.artifactId);
+    }
+  }
+
+  if (includeEvidence) {
+    for (const item of result.evidence ?? []) {
+      if (item.artifactId) {
+        ids.add(item.artifactId);
+      }
+    }
+  }
+
+  return [...ids];
+}
+
+function remapSubAgentArtifactIds(
+  result: SubAgentResult,
+  artifactIdMap: Map<string, string>
+): SubAgentResult {
+  if (artifactIdMap.size === 0) {
+    return result;
+  }
+
+  const remap = (id: string | undefined): string | undefined =>
+    id ? artifactIdMap.get(id) ?? id : undefined;
+
+  return {
+    ...result,
+    artifactIds: result.artifactIds?.map((id) => artifactIdMap.get(id) ?? id),
+    outputs: result.outputs?.map((output) => ({
+      ...output,
+      artifactId: remap(output.artifactId)
+    })),
+    evidence: result.evidence?.map((item) => ({
+      ...item,
+      artifactId: remap(item.artifactId)
+    }))
+  };
+}
+
+function getOutputTypeForArtifact(
+  artifact: Artifact
+): NonNullable<SubAgentResult["outputs"]>[number]["type"] {
+  switch (artifact.type) {
+    case "html":
+      return "html";
+    case "markdown":
+      return "markdown";
+    case "diff":
+      return "diff";
+    case "document":
+    case "presentation":
+    case "pdf":
+    case "code":
+      return "file";
+  }
+}
+
+function withArtifactLifecycle(
+  artifact: Artifact,
+  metadata: ArtifactMetadata,
+  db: AgentHubDatabase
+): Artifact {
+  return updateArtifactRow(
+    artifact.id,
+    {
+      metadata: {
+        ...(artifact.metadata ?? {}),
+        ...metadata
+      }
+    },
+    db
+  ) ?? {
+    ...artifact,
+    metadata: {
+      ...(artifact.metadata ?? {}),
+      ...metadata
+    }
+  };
+}
+
+function isSyntheticStepDeliverableArtifact(artifact: Artifact): boolean {
+  if (artifact.metadata?.official === false) {
+    return true;
+  }
+
+  if (
+    artifact.metadata?.origin === "synthetic_wrapper" ||
+    artifact.metadata?.origin === "intermediate"
+  ) {
+    return true;
+  }
+
+  if (artifact.type !== "markdown") {
+    return false;
+  }
+
+  const text = artifact.content.replace(/\s+/g, " ").trim();
+  return (
+    isLowValueSyntheticContent(text) ||
+    /^Artifact 已成功创建[（(]ID:/i.test(text) ||
+    /Artifact (?:has been )?created[（(]ID:/i.test(text) ||
+    /现在生成结构化摘要 artifact/i.test(text) ||
+    /已作为 Markdown 产物保存/i.test(text)
+  );
+}
+
+function extractArtifactIdsFromText(content: string, excludeArtifactId?: string): string[] {
+  const ids = new Set<string>();
+  const patterns = [
+    /Artifact 已成功创建[（(]ID:\s*([\w-]+)[）)]/gi,
+    /Artifact (?:has been )?created[（(]ID:\s*([\w-]+)[）)]/gi,
+    /"artifactId"\s*:\s*"([\w-]+)"/gi,
+    /artifactId:\s*([\w-]+)/gi
+  ];
+
+  for (const pattern of patterns) {
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(content)) !== null) {
+      const id = match[1]?.trim();
+      if (id && id !== excludeArtifactId) {
+        ids.add(id);
+      }
+    }
+  }
+
+  return [...ids];
+}
+
+function extractArtifactIdsFromSyntheticWrapper(artifact: Artifact): string[] {
+  return extractArtifactIdsFromText(artifact.content, artifact.id);
+}
+
+function uniqueArtifactsById(artifacts: Artifact[]): Artifact[] {
+  const seen = new Set<string>();
+  const result: Artifact[] = [];
+
+  for (const artifact of artifacts) {
+    if (seen.has(artifact.id)) {
+      continue;
+    }
+    seen.add(artifact.id);
+    result.push(artifact);
+  }
+
+  return result;
+}
+
+function getArtifactsByIds(
+  artifactIds: string[],
+  db: AgentHubDatabase
+): Artifact[] {
+  return artifactIds
+    .map((artifactId) => {
+      try {
+        return getArtifact(artifactId, db);
+      } catch {
+        return null;
+      }
+    })
+    .filter((artifact): artifact is Artifact => artifact !== null);
+}
+
+function getReferencedArtifacts(
+  result: SubAgentResult,
+  db: AgentHubDatabase
+): Artifact[] {
+  return getArtifactsByIds(collectSubAgentArtifactIds(result, true), db);
+}
+
+function buildRecoveredArtifactResult(input: {
+  result: SubAgentResult;
+  artifact: Artifact;
+  step: DispatchStep;
+}): SubAgentResult {
+  return {
+    ...input.result,
+    status: "completed",
+    summary: `${input.artifact.title} 已创建。`,
+    artifactIds: [input.artifact.id],
+    outputs: [
+      {
+        type: getOutputTypeForArtifact(input.artifact),
+        artifactId: input.artifact.id,
+        preview: getArtifactPreview(input.artifact.content),
+        isComplete: true
+      }
+    ],
+    evidence: input.step.targetCriteria.map((criterionId) => ({
+      criterionId,
+      artifactId: input.artifact.id,
+      summary: `${input.artifact.title} 是本步骤恢复确认的真实产物。`
+    })),
+    completedCriteria: input.step.targetCriteria,
+    unresolvedCriteria: [],
+    risks: input.result.risks.filter(
+      (risk) => !/结构化 SubAgentResult 解析失败/i.test(risk)
+    ),
+    nextSuggestedTask: undefined,
+    parseError: undefined,
+    metadata: {
+      ...(input.result.metadata ?? {}),
+      parseSucceeded: false,
+      recoveredFromTruncation: undefined
+    }
+  };
+}
+
+function mergeOfficialArtifactsIntoResult(
+  input: {
+    result: SubAgentResult;
+    officialArtifacts: Artifact[];
+  }
+): SubAgentResult {
+  if (input.officialArtifacts.length === 0) {
+    return input.result;
+  }
+
+  const officialIds = new Set(input.officialArtifacts.map((artifact) => artifact.id));
+  const existingOutputsByArtifactId = new Map(
+    (input.result.outputs ?? [])
+      .filter((output) => output.artifactId && officialIds.has(output.artifactId))
+      .map((output) => [output.artifactId as string, output])
+  );
+  const outputs = input.officialArtifacts.map((artifact) => {
+    const existing = existingOutputsByArtifactId.get(artifact.id);
+    return {
+      ...existing,
+      type: getOutputTypeForArtifact(artifact),
+      artifactId: artifact.id,
+      preview: existing?.preview ?? `${artifact.title}: ${getArtifactPreview(artifact.content)}`,
+      isComplete: existing?.isComplete ?? true
+    };
+  });
+
+  const existingEvidence = (input.result.evidence ?? []).filter(
+    (item) => !item.artifactId || officialIds.has(item.artifactId)
+  );
+  const evidence =
+    existingEvidence.length > 0
+      ? existingEvidence
+      : input.result.completedCriteria.map((criterionId, index) => {
+          const artifact = input.officialArtifacts[Math.min(index, input.officialArtifacts.length - 1)];
+          return {
+            criterionId,
+            artifactId: artifact.id,
+            summary: `${artifact.title} 是本步骤确认的真实产物。`
+          };
+        });
+
+  return {
+    ...input.result,
+    artifactIds: input.officialArtifacts.map((artifact) => artifact.id),
+    outputs,
+    evidence: evidence.length > 0 ? evidence : input.result.evidence
+  };
+}
+
+function normalizeSubAgentArtifactsForGroup(
+  input: {
+    result: SubAgentResult;
+    workspaceId: string;
+    conversationId: string;
+    agentId: string;
+    dispatchRunId: string;
+    dispatchStepId: string;
+    stepStartedAt: string;
+  },
+  db: AgentHubDatabase
+): { result: SubAgentResult; previewArtifacts: Artifact[] } {
+  const artifactIdMap = new Map<string, string>();
+
+  const referencedArtifacts = getReferencedArtifacts(input.result, db);
+  for (let artifact of referencedArtifacts) {
+    const sourceArtifactId = artifact.id;
+    if (
+      artifact.workspaceId !== input.workspaceId ||
+      artifact.conversationId !== input.conversationId
+    ) {
+      try {
+        artifact = createArtifact(
+          {
+            workspaceId: input.workspaceId,
+            conversationId: input.conversationId,
+            agentId: artifact.agentId,
+            type: artifact.type,
+            title: artifact.title,
+            content: artifact.content,
+            language: artifact.language,
+            filePath: artifact.filePath,
+            metadata: {
+              ...(artifact.metadata ?? {}),
+              origin: artifact.metadata?.origin ?? "final_output",
+              official: artifact.metadata?.official ?? true,
+              dispatchRunId: input.dispatchRunId,
+              dispatchStepId: input.dispatchStepId,
+              sourceArtifactId
+            }
+          },
+          db
+        );
+        artifactIdMap.set(sourceArtifactId, artifact.id);
+      } catch (error) {
+        console.warn("Failed to copy sub-agent artifact into group conversation.", {
+          artifactId: sourceArtifactId,
+          conversationId: input.conversationId,
+          error
+        });
+        continue;
+      }
+    }
+  }
+
+  const remappedResult = remapSubAgentArtifactIds(input.result, artifactIdMap);
+  const stepArtifacts = getArtifactsByConversationAgentSince(
+    input.conversationId,
+    input.agentId,
+    input.stepStartedAt,
+    db
+  );
+
+  const remappedReferencedArtifacts = getReferencedArtifacts(remappedResult, db);
+  const referencedRealArtifacts = remappedReferencedArtifacts.filter(
+    (artifact) => !isSyntheticStepDeliverableArtifact(artifact)
+  );
+  const wrappedRealArtifacts = getArtifactsByIds(
+    remappedReferencedArtifacts
+      .filter(isSyntheticStepDeliverableArtifact)
+      .flatMap(extractArtifactIdsFromSyntheticWrapper),
+    db
+  ).filter(
+    (artifact) =>
+      artifact.workspaceId === input.workspaceId &&
+      artifact.conversationId === input.conversationId &&
+      !isSyntheticStepDeliverableArtifact(artifact)
+  );
+  const stepRealArtifacts = stepArtifacts.filter(
+    (artifact) => !isSyntheticStepDeliverableArtifact(artifact)
+  );
+  let officialArtifacts: Artifact[];
+  if (referencedRealArtifacts.length > 0) {
+    officialArtifacts = uniqueArtifactsById(referencedRealArtifacts);
+  } else if (wrappedRealArtifacts.length > 0) {
+    officialArtifacts = uniqueArtifactsById(wrappedRealArtifacts);
+  } else if (stepRealArtifacts.length > 0) {
+    officialArtifacts = [stepRealArtifacts[stepRealArtifacts.length - 1]];
+  } else {
+    officialArtifacts = [];
+  }
+  officialArtifacts = officialArtifacts.map((artifact) =>
+    withArtifactLifecycle(
+      artifact,
+      {
+        origin: artifact.metadata?.origin ?? "final_output",
+        official: true,
+        dispatchRunId: input.dispatchRunId,
+        dispatchStepId: input.dispatchStepId
+      },
+      db
+    )
+  );
+  const officialArtifactIds = new Set(officialArtifacts.map((artifact) => artifact.id));
+
+  if (officialArtifacts.length > 0) {
+    for (const artifact of stepArtifacts) {
+      if (!officialArtifactIds.has(artifact.id)) {
+        deleteArtifact(artifact.id, db);
+      }
+    }
+  }
+
+  const result = mergeOfficialArtifactsIntoResult({
+    result: remappedResult,
+    officialArtifacts
+  });
+  const previewArtifacts = officialArtifacts.filter((artifact) => artifact.type !== "diff");
+
+  return { result, previewArtifacts };
+}
+
+function sanitizeMarkdownReportTitle(title: string): string {
+  const normalized = title
+    .replace(/html\s*slide\s*deck/gi, "报告")
+    .replace(/slide\s*deck|slides?|presentation|pptx?|演示文稿|演示稿|幻灯片|PPT/gi, "报告")
+    .replace(/报告\s*报告/g, "报告")
+    .replace(/分析\s+报告/g, "分析报告")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return /报告|摘要|总结|汇总|调研/.test(normalized)
+    ? normalized
+    : `${normalized || "Markdown"} 报告`;
+}
+
+function rewritePresentationLabelForMarkdown(text: string | undefined): string | undefined {
+  if (!text) {
+    return text;
+  }
+  return text
+    .replace(/html\s*slide\s*deck/gi, "Markdown 报告")
+    .replace(/slide\s*deck|slides?|presentation|pptx?|演示文稿|演示稿|幻灯片|PPT/gi, "Markdown 报告")
+    .replace(/Markdown 报告\s*Markdown 报告/g, "Markdown 报告");
+}
+
+function normalizeResultLabelsForDeliverableKind(
+  input: {
+    result: SubAgentResult;
+    previewArtifacts: Artifact[];
+    requirement: RequiredDeliverableKind | null;
+  },
+  db: AgentHubDatabase
+): { result: SubAgentResult; previewArtifacts: Artifact[] } {
+  if (input.requirement !== "markdown") {
+    return input;
+  }
+
+  const renamedArtifacts = new Map<string, Artifact>();
+  const previewArtifacts = input.previewArtifacts.map((artifact) => {
+    if (
+      artifact.type !== "markdown" ||
+      !/pptx?|slide\s*deck|slides?|presentation|演示文稿|演示稿|幻灯片|PPT/i.test(artifact.title)
+    ) {
+      return artifact;
+    }
+
+    const updated = updateArtifactRow(
+      artifact.id,
+      { title: sanitizeMarkdownReportTitle(artifact.title) },
+      db
+    ) ?? artifact;
+    renamedArtifacts.set(artifact.id, updated);
+    return updated;
+  });
+
+  if (renamedArtifacts.size === 0) {
+    return input;
+  }
+
+  const result: SubAgentResult = {
+    ...input.result,
+    summary: rewritePresentationLabelForMarkdown(input.result.summary) ?? input.result.summary,
+    deliverable: rewritePresentationLabelForMarkdown(input.result.deliverable),
+    outputs: input.result.outputs?.map((output) => {
+      const artifact = output.artifactId ? renamedArtifacts.get(output.artifactId) : undefined;
+      if (!artifact) {
+        return {
+          ...output,
+          preview: rewritePresentationLabelForMarkdown(output.preview)
+        };
+      }
+      return {
+        ...output,
+        type: "markdown",
+        preview: `${artifact.title}: ${getArtifactPreview(artifact.content)}`
+      };
+    }),
+    evidence: input.result.evidence?.map((item) => ({
+      ...item,
+      summary: rewritePresentationLabelForMarkdown(item.summary) ?? item.summary
+    }))
+  };
+
+  return { result, previewArtifacts };
+}
+
+function artifactMatchesDeliverableKind(
+  artifact: Artifact,
+  requirement: RequiredDeliverableKind | null
+): boolean {
+  if (!requirement) {
+    return false;
+  }
+
+  if (requirement === "markdown") {
+    return artifact.type === "markdown";
+  }
+
+  if (requirement === "html") {
+    return artifact.type === "html";
+  }
+
+  const text = `${artifact.title}\n${artifact.content}`;
+  return (
+    artifact.type === "presentation" ||
+    artifact.type === "pdf" ||
+    (
+      artifact.type === "html" &&
+      /pptx?|slide\s*deck|slides?|presentation|keynote|演示文稿|演示稿|幻灯片|PPT|封面|目录/i.test(text)
+    )
+  );
+}
+
+function removeSupersededArtifactsForCriteria(
+  input: {
+    step: DispatchStep;
+    result: SubAgentResult;
+    requirement: RequiredDeliverableKind | null;
+  },
+  db: AgentHubDatabase
+): void {
+  if (!input.requirement || input.step.targetCriteria.length === 0) {
+    return;
+  }
+
+  const currentIds = new Set(collectSubAgentArtifactIds(input.result, true));
+  if (currentIds.size === 0) {
+    return;
+  }
+
+  const targetCriteria = new Set(input.step.targetCriteria);
+  const previousSteps = getStepsByDispatchRun(input.step.dispatchRunId, db).filter(
+    (step) =>
+      step.id !== input.step.id &&
+      step.stepIndex < input.step.stepIndex &&
+      step.targetCriteria.some((criterionId) => targetCriteria.has(criterionId))
+  );
+
+  for (const previousStep of previousSteps) {
+    const previousResult = previousStep.subAgentResult;
+    if (!previousResult) {
+      continue;
+    }
+
+    for (const artifact of getReferencedArtifacts(previousResult, db)) {
+      if (
+        currentIds.has(artifact.id) ||
+        artifact.metadata?.official === false ||
+        !artifactMatchesDeliverableKind(artifact, input.requirement)
+      ) {
+        continue;
+      }
+      deleteArtifact(artifact.id, db);
+    }
+  }
 }
 
 function buildSubAgentManifestRepairPrompt(input: {
@@ -668,6 +1633,19 @@ function formatSubAgentResultForContext(result: SubAgentResult): PreviousTaskSum
         : undefined,
     nextRequiredActions: result.nextSuggestedTask ? [result.nextSuggestedTask] : undefined
   };
+}
+
+function shouldShareSubAgentResultWithLaterSteps(result: SubAgentResult): boolean {
+  if (result.parseError) {
+    return false;
+  }
+  if (result.status !== "completed" && result.status !== "no_changes_needed") {
+    return false;
+  }
+  if (result.status === "completed" && result.completedCriteria.length === 0) {
+    return false;
+  }
+  return true;
 }
 
 function toPlanAssignments(
@@ -1119,7 +2097,7 @@ function buildSubAgentPrompt(taskInput: SubAgentTaskInput): string {
     `  "summary": "执行摘要",`,
     `  "deliverable": "可选短预览。不要放长正文",`,
     `  "artifactIds": ["长正文 artifact id，如有"],`,
-    `  "outputs": [{ "type": "markdown | text | diff | file | json | command_result", "artifactId": "artifact-id", "diffProposalId": "diff-id", "filePath": "path", "preview": "短预览", "isComplete": true }],`,
+    `  "outputs": [{ "type": "markdown | html | text | diff | file | json | command_result", "artifactId": "artifact-id", "diffProposalId": "diff-id", "filePath": "path", "preview": "短预览", "isComplete": true }],`,
     `  "evidence": [{ "criterionId": "criterion-id", "artifactId": "artifact-id", "summary": "该产物如何满足验收项" }],`,
     `  "completedCriteria": ["criterion-id"],`,
     `  "unresolvedCriteria": ["criterion-id"],`,
@@ -1208,22 +2186,17 @@ function validateDispatchPlan(
   return true;
 }
 
-function getOrCreateAgentConversation(
+function createDispatchStepAgentConversation(
   agent: Agent,
-  instruction: string,
+  step: DispatchStep,
   db: AgentHubDatabase
 ): Conversation {
-  const existing = getFirstConversationByAgent(agent.id, db);
-  if (existing) {
-    return existing;
-  }
-
   return createConversation(
     {
       workspaceId: agent.workspaceId,
       workspaceContextId: agent.defaultWorkspaceContextId ?? null,
       agentId: agent.id,
-      title: instruction.slice(0, 50) || `Chat with ${agent.name}`,
+      title: `${agent.name} dispatch ${step.stepIndex + 1}`.slice(0, 50),
       mode: "single",
       provider: agent.runtimeProvider
     },
@@ -1358,6 +2331,7 @@ async function executeSubAgentStep(
     gitEnabled: resolvedGroupWorkspace.gitEnabled
   };
 
+  const stepStartedAt = new Date().toISOString();
   updateStepStatus(step.id, "running", null, null, db);
   stream?.({
     type: "dispatch_step_update",
@@ -1548,8 +2522,9 @@ async function executeSubAgentStep(
       );
       return { success: true, outputMessage, subAgentResult };
     } else {
-      // Sub-agent: use single-chat conversation for context and provider session sharing
-      const agentConversation = getOrCreateAgentConversation(agent, step.instruction, db);
+      // Sub-agent: use a fresh per-step conversation so old private chat context
+      // cannot leak into group artifacts. Continuations still resume this step.
+      const agentConversation = createDispatchStepAgentConversation(agent, step, db);
 
       console.info("[AgentHub] dispatchService.runDispatchStep start", {
         agentId: agent.id,
@@ -1566,6 +2541,9 @@ async function executeSubAgentStep(
       let subAgentResult: SubAgentResult | null = null;
       let continuationAttempts = 0;
       let manifestRepairRequested = false;
+      let deliverableRepairAttempts = 0;
+      let subAgentResultPrepared = false;
+      let normalizedPreviewArtifacts: Artifact[] = [];
       const generatedArtifacts: Artifact[] = [];
       let nextPrompt = subAgentPrompt;
 
@@ -1584,7 +2562,15 @@ async function executeSubAgentStep(
             workspaceContextId: resolvedGroupWorkspace.workspaceContextId,
             workspaceRootPath: resolvedGroupWorkspace.rootPath,
             executionScope: "group_subagent",
-            dispatchStepId: step.id
+            dispatchStepId: step.id,
+            artifactTarget: {
+              workspaceId: conversation.workspaceId,
+              conversationId: conversation.id,
+              workspaceRootPath: resolvedGroupWorkspace.rootPath,
+              workspaceContextId: resolvedGroupWorkspace.workspaceContextId,
+              dispatchRunId: step.dispatchRunId,
+              dispatchStepId: step.id
+            }
           },
           db,
           streamSink
@@ -1692,7 +2678,12 @@ async function executeSubAgentStep(
         if (
           subAgentResult.parseError &&
           aggregateReplyText.trim().length > 0 &&
-          !manifestRepairRequested
+          !manifestRepairRequested &&
+          shouldPersistParseFailureAsArtifact({
+            content: aggregateReplyText,
+            step,
+            criteria: scopedCriteria
+          })
         ) {
           const artifact = createSubAgentMarkdownArtifact(
             {
@@ -1702,7 +2693,9 @@ async function executeSubAgentStep(
               agentName: agent.name,
               step,
               content: aggregateReplyText.trim(),
-              titleSuffix: "Deliverable"
+              titleSuffix: "Deliverable",
+              origin: "fallback_parse_dump",
+              official: true
             },
             db
           );
@@ -1728,6 +2721,174 @@ async function executeSubAgentStep(
             previousSummary: subAgentResult.summary
           });
           continue;
+        }
+
+        if (subAgentResult.parseError && aggregateReplyText.trim().length > 0) {
+          const requirement = inferRequiredDeliverableKind({
+            step,
+            criteria: scopedCriteria
+          });
+          const embeddedArtifacts = getArtifactsByIds(
+            extractArtifactIdsFromText(aggregateReplyText),
+            db
+          ).filter(
+            (artifact) =>
+              artifact.workspaceId === conversation.workspaceId &&
+              artifact.conversationId === conversation.id &&
+              artifact.agentId === agent.id &&
+              !isSyntheticStepDeliverableArtifact(artifact)
+          );
+          const recoveredArtifact = embeddedArtifacts.find((artifact) =>
+            requirement === "presentation"
+              ? hasSubstantialPresentationContent(artifact)
+              : requirement === "html"
+                ? hasSubstantialHtmlContent(artifact)
+                : requirement === "markdown"
+                  ? hasSubstantialMarkdownContent(
+                      artifact,
+                      getDeliverableTaskText({ step, criteria: scopedCriteria })
+                    )
+                  : false
+          );
+
+          if (recoveredArtifact) {
+            subAgentResult = buildRecoveredArtifactResult({
+              result: subAgentResult,
+              artifact: recoveredArtifact,
+              step
+            });
+          } else if (
+            requirement &&
+            deliverableRepairAttempts < MAX_SUB_AGENT_DELIVERABLE_REPAIRS
+          ) {
+            deliverableRepairAttempts += 1;
+            emitStepProgress(
+              {
+                conversationId: conversation.id,
+                step,
+                agentName: agent.name,
+                title: "交付物无效，正在重新生成",
+                body: "子 Agent 只返回了过程或包装文本，没有返回可验收的真实产物。",
+                level: "warning",
+                phase: "validation",
+                status: "streaming"
+              },
+              db,
+              stream
+            );
+            aggregateReplyText = "";
+            nextPrompt = buildSubAgentDeliverableRepairPrompt({
+              step,
+              criteria: scopedCriteria,
+              previousResult: subAgentResult,
+              validation: {
+                valid: false,
+                requirement,
+                reason: "子 Agent 只返回了过程或包装文本，没有返回可验收的真实产物。"
+              }
+            });
+            continue;
+          }
+        }
+
+        if (!subAgentResult.parseError) {
+          const moved = maybeMoveLongDeliverableToArtifact(
+            {
+              result: subAgentResult,
+              workspaceId: conversation.workspaceId,
+              conversationId: conversation.id,
+              agentId: agent.id,
+              agentName: agent.name,
+              step
+            },
+            db
+          );
+          let candidateResult = attachArtifactsToSubAgentResult(
+            moved.result,
+            [...generatedArtifacts, ...moved.artifacts]
+          );
+          const normalizedArtifacts = normalizeSubAgentArtifactsForGroup(
+            {
+              result: candidateResult,
+              workspaceId: conversation.workspaceId,
+              conversationId: conversation.id,
+              agentId: agent.id,
+              dispatchRunId: step.dispatchRunId,
+              dispatchStepId: step.id,
+              stepStartedAt
+            },
+            db
+          );
+          candidateResult = normalizedArtifacts.result;
+
+          const deliverableValidation = validateRequiredDeliverableArtifacts({
+            result: candidateResult,
+            step,
+            criteria: scopedCriteria,
+            db
+          });
+
+          if (
+            !deliverableValidation.valid &&
+            deliverableRepairAttempts < MAX_SUB_AGENT_DELIVERABLE_REPAIRS
+          ) {
+            deliverableRepairAttempts += 1;
+            emitStepProgress(
+              {
+                conversationId: conversation.id,
+                step,
+                agentName: agent.name,
+                title: "交付物无效，正在重新生成",
+                body: deliverableValidation.reason,
+                level: "warning",
+                phase: "validation",
+                status: "streaming"
+              },
+              db,
+              stream
+            );
+            aggregateReplyText = "";
+            generatedArtifacts.length = 0;
+            nextPrompt = buildSubAgentDeliverableRepairPrompt({
+              step,
+              criteria: scopedCriteria,
+              previousResult: candidateResult,
+              validation: deliverableValidation
+            });
+            continue;
+          }
+
+          if (!deliverableValidation.valid) {
+            demoteInvalidDeliverableArtifacts(candidateResult, db);
+            candidateResult = markInvalidDeliverableResult({
+              result: candidateResult,
+              step,
+              validation: deliverableValidation
+            });
+            normalizedPreviewArtifacts = [];
+          } else {
+            const normalizedLabels = normalizeResultLabelsForDeliverableKind(
+              {
+                result: candidateResult,
+                previewArtifacts: normalizedArtifacts.previewArtifacts,
+                requirement: deliverableValidation.requirement
+              },
+              db
+            );
+            candidateResult = normalizedLabels.result;
+            normalizedPreviewArtifacts = normalizedLabels.previewArtifacts;
+            removeSupersededArtifactsForCriteria(
+              {
+                step,
+                result: candidateResult,
+                requirement: deliverableValidation.requirement
+              },
+              db
+            );
+          }
+
+          subAgentResult = candidateResult;
+          subAgentResultPrepared = true;
         }
 
         break;
@@ -1765,7 +2926,7 @@ async function executeSubAgentStep(
         finishReason: subAgentResult.metadata?.finishReason
       });
 
-      if (!subAgentResult.parseError) {
+      if (!subAgentResultPrepared && !subAgentResult.parseError) {
         const moved = maybeMoveLongDeliverableToArtifact(
           {
             result: subAgentResult,
@@ -1781,7 +2942,7 @@ async function executeSubAgentStep(
           moved.result,
           [...generatedArtifacts, ...moved.artifacts]
         );
-      } else if (generatedArtifacts.length > 0) {
+      } else if (!subAgentResultPrepared && generatedArtifacts.length > 0) {
         subAgentResult = attachArtifactsToSubAgentResult(subAgentResult, generatedArtifacts);
       }
 
@@ -1852,6 +3013,23 @@ async function executeSubAgentStep(
         };
       }
 
+      if (!subAgentResultPrepared) {
+        const normalizedArtifacts = normalizeSubAgentArtifactsForGroup(
+          {
+          result: subAgentResult,
+          workspaceId: conversation.workspaceId,
+          conversationId: conversation.id,
+          agentId: agent.id,
+          dispatchRunId: step.dispatchRunId,
+          dispatchStepId: step.id,
+          stepStartedAt
+        },
+        db
+        );
+        subAgentResult = normalizedArtifacts.result;
+        normalizedPreviewArtifacts = normalizedArtifacts.previewArtifacts;
+      }
+
       updateStepSubAgentResult(step.id, subAgentResult, db);
 
       if (agentReply) {
@@ -1880,6 +3058,16 @@ async function executeSubAgentStep(
           },
           db
         );
+        for (const artifact of normalizedPreviewArtifacts) {
+          attachArtifactPreviewToMessage(
+            {
+              messageId: outputMessage.id,
+              conversationId: conversation.id,
+              artifact
+            },
+            db
+          );
+        }
       }
 
       const stepStatus = toStepStatus(subAgentResult.status);
@@ -2205,7 +3393,9 @@ async function executeStructuredGroupDispatch(
       );
       for (const result of batchResults) {
         results.push(result.subAgentResult);
-        previousOutputs.push(formatSubAgentResultForContext(result.subAgentResult));
+        if (shouldShareSubAgentResultWithLaterSteps(result.subAgentResult)) {
+          previousOutputs.push(formatSubAgentResultForContext(result.subAgentResult));
+        }
       }
       for (const assignment of batch) {
         completedTaskIds.add(assignment.id);

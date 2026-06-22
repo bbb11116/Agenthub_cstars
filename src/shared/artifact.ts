@@ -38,6 +38,24 @@ export type ArtifactRenderManifest = {
   generatedAt?: string;
 };
 
+export type ArtifactLifecycleOrigin =
+  | "final_output"
+  | "intermediate"
+  | "synthetic_wrapper"
+  | "fallback_parse_dump"
+  | "diff_preview";
+
+export type ArtifactMetadata = {
+  language?: string;
+  version?: number;
+  render?: ArtifactRenderManifest;
+  origin?: ArtifactLifecycleOrigin;
+  official?: boolean;
+  dispatchRunId?: string;
+  dispatchStepId?: string;
+  sourceArtifactId?: string;
+};
+
 export type Artifact = {
   id: string;
   workspaceId: string;
@@ -49,6 +67,7 @@ export type Artifact = {
   language?: string;
   filePath?: string;
   render?: ArtifactRenderManifest;
+  metadata?: ArtifactMetadata;
   version: number;
   createdAt: string;
 };
@@ -63,6 +82,7 @@ export type CreateArtifactInput = {
   language?: string;
   filePath?: string;
   render?: ArtifactRenderManifest;
+  metadata?: ArtifactMetadata;
   version?: number;
 };
 
@@ -72,7 +92,10 @@ export type PreviewArtifactInput = {
 };
 
 export type UpdateArtifactInput = Partial<
-  Pick<Artifact, "type" | "title" | "content" | "language" | "filePath" | "render" | "version">
+  Pick<
+    Artifact,
+    "type" | "title" | "content" | "language" | "filePath" | "render" | "metadata" | "version"
+  >
 >;
 
 export type ArtifactPreviewPayload = {

@@ -69,9 +69,10 @@ export class UnifiedAgentProviderAdapter implements AgentProviderAdapter {
       systemPrompt: input.systemPrompt,
       userMessage: input.userMessage,
       contextMessages: input.contextMessages,
+      artifactTarget: input.artifactTarget,
       toolPermissions: input.toolPermissions ?? [],
       runOptions: {
-        mode: "single_chat",
+        mode: input.executionMode ?? "single_chat",
         maxIterations: input.maxIterations,
         conversationId: input.conversationId,
         agentId: input.agentId,
